@@ -281,6 +281,47 @@ class TaskStore:
                 return session_entry
         return None
 
+    def register_people(self, *names: str | None):
+        names_clean = [n.strip() for n in names if n and n.strip()]
+        if not names_clean:
+            return
+        current = set(self.data.get("meta", {}).get("people", []))
+        updated = False
+        for name in names_clean:
+            if name not in current:
+                current.add(name)
+                updated = True
+        if updated:
+            self.data["meta"]["people"] = sorted(current)
+
+    def get_people(self) -> list[str]:
+        return list(self.data.get("meta", {}).get("people", []))
+
+    def append_session(self, task_id: int, minutes: int, note: str):
+        for t in self.data.get("tasks", []):
+            if t.get("id") == task_id:
+                self._ensure_task_defaults(t)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                session_entry = {
+                    "timestamp": timestamp,
+                    "minutes": minutes,
+                    "note": note,
+                }
+                t["sessions"].append(session_entry)
+                t["time_spent_minutes"] = int(t.get("time_spent_minutes", 0)) + int(minutes)
+                addition = f"[{timestamp}] ({minutes} min)"
+                if note:
+                    addition += f" {note}"
+                existing = t.get("description", "").rstrip()
+                if existing:
+                    new_desc = existing + "\n" + addition
+                else:
+                    new_desc = addition
+                t["description"] = new_desc
+                self.save()
+                return session_entry
+        return None
+
     def eligible_today(self):
         today = date.today()
         return [
@@ -319,9 +360,11 @@ class TaskCard(ctk.CTkFrame):
         self.on_focus_toggle = on_focus_toggle
         self.on_start_timer = on_start_timer
 
+        self.configure(padx=12, pady=12)
+
         # Left labels container
         left = ctk.CTkFrame(self, fg_color="transparent")
-        left.grid(row=0, column=0, sticky="w", padx=(12, 6), pady=12)
+        left.grid(row=0, column=0, sticky="w")
 
         title_row = ctk.CTkFrame(left, fg_color="transparent")
         title_row.pack(anchor="w")
@@ -379,7 +422,7 @@ class TaskCard(ctk.CTkFrame):
 
         # Right buttons
         btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=0, column=1, sticky="e", padx=(6, 12), pady=12)
+        btns.grid(row=0, column=1, sticky="e")
 
         focus_text = "Unfocus" if task.get("focus") else "Focus ⭐"
         self.focus_btn = ctk.CTkButton(btns, text=focus_text, command=lambda: self.on_focus_toggle(task))
@@ -811,39 +854,14 @@ class TaskFocusApp(ctk.CTk):
         container = ctk.CTkFrame(self.bulk_tab)
         container.pack(fill="both", expand=True, padx=12, pady=12)
 
-        self.bulk_instruction_text = (
-            "Use this structure when asking an AI assistant to prepare bulk tasks.\n"
-            "Each task should be on its own line using this template:\n"
-            "Type: Title — asked by <who asked> — assignee <assignee> — start <yyyy-mm-dd> — "
-            "deadline <yyyy-mm-dd> — priority <High|Medium|Low> — description <details>\n\n"
-            "Required field: Title. Optional fields may be omitted.\n"
-            "Dates accept yyyy-mm-dd or dd.mm.yyyy formats."
+        help_text = (
+            "Paste tasks using this simple template (one per line):\n"
+            "Make: Write PT summary — asked by Alex — start 2025-10-06 — deadline 2025-10-08 — priority High\n"
+            "Ask: Confirm PT rules with Devs — asked by Lena\n\n"
+            "Supported keys: asked by, start, deadline, priority.\n"
+            "Dates: yyyy-mm-dd or dd.mm.yyyy; Priority: High/Medium/Low."
         )
-
-        instruct_frame = ctk.CTkFrame(container)
-        instruct_frame.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(
-            instruct_frame,
-            text="Bulk import instructions for AI assistant",
-            font=("Segoe UI", 14, "bold"),
-        ).pack(anchor="w", padx=4, pady=(4, 2))
-        ctk.CTkLabel(
-            instruct_frame,
-            text=self.bulk_instruction_text,
-            justify="left",
-        ).pack(anchor="w", padx=4, pady=(0, 6))
-        ctk.CTkButton(
-            instruct_frame,
-            text="Copy instructions",
-            command=self._copy_bulk_instructions,
-            width=160,
-        ).pack(anchor="w", padx=4)
-
-        form_help = (
-            "Paste one task per line in the editor below. Supported fields match the Add Task form:\n"
-            "Title, Type, Priority, Who asked, Assignee, Start Date, Deadline, Description."
-        )
-        ctk.CTkLabel(container, text=form_help, justify="left").pack(anchor="w", pady=(0, 8))
+        ctk.CTkLabel(container, text=help_text, justify="left").pack(anchor="w", pady=(0,8))
 
         self.bulk_text = ctk.CTkTextbox(container, height=320)
         self.bulk_text.pack(fill="both", expand=True)
@@ -1054,11 +1072,6 @@ class TaskFocusApp(ctk.CTk):
             if m4:
                 pr = m4.group(1).capitalize()
                 continue
-            # key: description / notes
-            m5 = re.match(r"(?i)^(description|desc|notes?)\s*:?\s*(.+)$", s)
-            if m5:
-                description = m5.group(2).strip()
-                continue
 
         if ttype not in TASK_TYPES:
             ttype = TASK_TYPES[0]
@@ -1070,21 +1083,13 @@ class TaskFocusApp(ctk.CTk):
             "type": ttype,
             "priority": pr,
             "who_asked": who,
-            "assignee": assignee,
+            "assignee": "",
             "start_date": start_s,
             "deadline": deadline_s,
             "status": "open",
             "focus": False,
-            "description": description,
+            "description": "",
         }
-
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
 
     def _prompt_focus_selection(self):
         tasks = self.store.eligible_today()
