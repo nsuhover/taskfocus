@@ -322,6 +322,47 @@ class TaskStore:
                 return session_entry
         return None
 
+    def register_people(self, *names: str | None):
+        names_clean = [n.strip() for n in names if n and n.strip()]
+        if not names_clean:
+            return
+        current = set(self.data.get("meta", {}).get("people", []))
+        updated = False
+        for name in names_clean:
+            if name not in current:
+                current.add(name)
+                updated = True
+        if updated:
+            self.data["meta"]["people"] = sorted(current)
+
+    def get_people(self) -> list[str]:
+        return list(self.data.get("meta", {}).get("people", []))
+
+    def append_session(self, task_id: int, minutes: int, note: str):
+        for t in self.data.get("tasks", []):
+            if t.get("id") == task_id:
+                self._ensure_task_defaults(t)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                session_entry = {
+                    "timestamp": timestamp,
+                    "minutes": minutes,
+                    "note": note,
+                }
+                t["sessions"].append(session_entry)
+                t["time_spent_minutes"] = int(t.get("time_spent_minutes", 0)) + int(minutes)
+                addition = f"[{timestamp}] ({minutes} min)"
+                if note:
+                    addition += f" {note}"
+                existing = t.get("description", "").rstrip()
+                if existing:
+                    new_desc = existing + "\n" + addition
+                else:
+                    new_desc = addition
+                t["description"] = new_desc
+                self.save()
+                return session_entry
+        return None
+
     def eligible_today(self):
         today = date.today()
         return [
@@ -380,8 +421,14 @@ class TaskCard(ctk.CTkFrame):
             "Medium": "#A78BFA",  # purple-light
             "Low": "#64748B"     # slate
         }.get(pr, "#A78BFA")
-        pr_badge = ctk.CTkLabel(title_row, text=pr, fg_color=pr_color, text_color="#000000", corner_radius=8, padx=8, pady=2)
-        pr_badge.pack(side="left")
+        pr_badge = ctk.CTkLabel(
+            title_row,
+            text=f" {pr} ",
+            fg_color=pr_color,
+            text_color="#000000",
+            corner_radius=8,
+        )
+        pr_badge.pack(side="left", pady=2)
 
         # Meta line
         meta = []
