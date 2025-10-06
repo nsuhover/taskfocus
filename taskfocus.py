@@ -994,9 +994,11 @@ class TaskFocusApp(ctk.CTk):
         info = parts[1:]
 
         who = ""
+        assignee = ""
         start_s = today_str()
         deadline_s = ""
         pr = "Medium"
+        description = ""
 
         for seg in info:
             s = seg.strip()
@@ -1004,6 +1006,11 @@ class TaskFocusApp(ctk.CTk):
             m1 = re.match(r"(?i)^asked\s+by\s*:?\s*(.+)$", s)
             if m1:
                 who = m1.group(1).strip()
+                continue
+            # key: assignee / assigned to
+            m1b = re.match(r"(?i)^(assignee|assigned\s+to)\s*:?\s*(.+)$", s)
+            if m1b:
+                assignee = m1b.group(2).strip()
                 continue
             # key: start date
             m2 = re.match(r"(?i)^start\s*:?\s*(.+)$", s)
