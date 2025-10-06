@@ -26,7 +26,7 @@ import re
 from datetime import datetime, date
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog
 
 try:
     import customtkinter as ctk
@@ -162,7 +162,7 @@ def sort_key(task: dict):
 class TaskStore:
     def __init__(self, path):
         self.path = path
-        self.data = {"tasks": [], "meta": {"last_focus_date": None}}
+        self.data = {"tasks": [], "meta": {"last_focus_date": None, "people": []}}
         self.load()
 
     def load(self):
@@ -174,10 +174,16 @@ class TaskStore:
                 self.data = json.load(f)
             # Backward compatibility
             if "meta" not in self.data:
-                self.data["meta"] = {"last_focus_date": None}
+                self.data["meta"] = {"last_focus_date": None, "people": []}
+            if "people" not in self.data.get("meta", {}):
+                self.data["meta"]["people"] = []
+            # Ensure defaults on old tasks
+            for task in self.data.get("tasks", []):
+                self._ensure_task_defaults(task)
+                self.register_people(task.get("who_asked"), task.get("assignee"))
         except Exception:
             # Create fresh if corrupted
-            self.data = {"tasks": [], "meta": {"last_focus_date": None}}
+            self.data = {"tasks": [], "meta": {"last_focus_date": None, "people": []}}
             self.save()
 
     def save(self):
@@ -186,6 +192,13 @@ class TaskStore:
             json.dump(self.data, f, indent=2, ensure_ascii=False)
 
     # --- Task operations ---
+    def _ensure_task_defaults(self, task: dict):
+        task.setdefault("description", "")
+        task.setdefault("assignee", "")
+        task.setdefault("time_spent_minutes", 0)
+        task.setdefault("sessions", [])
+        return task
+
     def _next_id(self) -> int:
         if not self.data["tasks"]:
             return 1
@@ -202,7 +215,8 @@ class TaskStore:
         task.setdefault("status", "open")
         task.setdefault("focus", False)
         task.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
-        self.data["tasks"].append(task)
+        self.data["tasks"].append(self._ensure_task_defaults(task))
+        self.register_people(task.get("who_asked"), task.get("assignee"))
         self.save()
         return task
 
@@ -210,6 +224,8 @@ class TaskStore:
         for t in self.data["tasks"]:
             if t.get("id") == task_id:
                 t.update(updates)
+                self._ensure_task_defaults(t)
+                self.register_people(t.get("who_asked"), t.get("assignee"))
                 self.save()
                 return t
         return None
@@ -223,6 +239,47 @@ class TaskStore:
         if status in STATUSES:
             tasks = [t for t in tasks if t.get("status") == status]
         return tasks
+
+    def register_people(self, *names: str | None):
+        names_clean = [n.strip() for n in names if n and n.strip()]
+        if not names_clean:
+            return
+        current = set(self.data.get("meta", {}).get("people", []))
+        updated = False
+        for name in names_clean:
+            if name not in current:
+                current.add(name)
+                updated = True
+        if updated:
+            self.data["meta"]["people"] = sorted(current)
+
+    def get_people(self) -> list[str]:
+        return list(self.data.get("meta", {}).get("people", []))
+
+    def append_session(self, task_id: int, minutes: int, note: str):
+        for t in self.data.get("tasks", []):
+            if t.get("id") == task_id:
+                self._ensure_task_defaults(t)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                session_entry = {
+                    "timestamp": timestamp,
+                    "minutes": minutes,
+                    "note": note,
+                }
+                t["sessions"].append(session_entry)
+                t["time_spent_minutes"] = int(t.get("time_spent_minutes", 0)) + int(minutes)
+                addition = f"[{timestamp}] ({minutes} min)"
+                if note:
+                    addition += f" {note}"
+                existing = t.get("description", "").rstrip()
+                if existing:
+                    new_desc = existing + "\n" + addition
+                else:
+                    new_desc = addition
+                t["description"] = new_desc
+                self.save()
+                return session_entry
+        return None
 
     def eligible_today(self):
         today = date.today()
@@ -254,18 +311,17 @@ class TaskStore:
 # GUI Components
 # -------------------------------
 class TaskCard(ctk.CTkFrame):
-    def __init__(self, master, task: dict, on_edit, on_done_toggle, on_focus_toggle):
+    def __init__(self, master, task: dict, on_edit, on_done_toggle, on_focus_toggle, on_start_timer):
         super().__init__(master)
         self.task = task
         self.on_edit = on_edit
         self.on_done_toggle = on_done_toggle
         self.on_focus_toggle = on_focus_toggle
-
-        self.configure(padx=12, pady=12)
+        self.on_start_timer = on_start_timer
 
         # Left labels container
         left = ctk.CTkFrame(self, fg_color="transparent")
-        left.grid(row=0, column=0, sticky="w")
+        left.grid(row=0, column=0, sticky="w", padx=(12, 6), pady=12)
 
         title_row = ctk.CTkFrame(left, fg_color="transparent")
         title_row.pack(anchor="w")
@@ -292,6 +348,17 @@ class TaskCard(ctk.CTkFrame):
         who = task.get("who_asked")
         if who:
             meta.append(f"Asked by: {who}")
+        assignee = task.get("assignee")
+        if assignee:
+            meta.append(f"Assignee: {assignee}")
+        minutes = int(task.get("time_spent_minutes", 0) or 0)
+        if minutes:
+            hours, mins = divmod(minutes, 60)
+            if hours:
+                time_text = f"{hours}h {mins}m" if mins else f"{hours}h"
+            else:
+                time_text = f"{mins}m"
+            meta.append(f"Time spent: {time_text}")
         sd = task.get("start_date") or "—"
         dl = task.get("deadline") or "—"
         # Overdue visual hint
@@ -302,16 +369,24 @@ class TaskCard(ctk.CTkFrame):
         dl_text = f"Due: {dl}"
         if overdue:
             dl_text += "  (OVERDUE)"
-        meta_line = ctk.CTkLabel(left, text=f"{ ' | '.join(meta) }\nStart: {sd} | {dl_text}", justify="left")
+        top_line = " | ".join(meta)
+        if top_line:
+            meta_text = f"{top_line}\nStart: {sd} | {dl_text}"
+        else:
+            meta_text = f"Start: {sd} | {dl_text}"
+        meta_line = ctk.CTkLabel(left, text=meta_text, justify="left")
         meta_line.pack(anchor="w", pady=(6, 0))
 
         # Right buttons
         btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=0, column=1, sticky="e")
+        btns.grid(row=0, column=1, sticky="e", padx=(6, 12), pady=12)
 
         focus_text = "Unfocus" if task.get("focus") else "Focus ⭐"
         self.focus_btn = ctk.CTkButton(btns, text=focus_text, command=lambda: self.on_focus_toggle(task))
         self.focus_btn.pack(side="left", padx=6)
+
+        self.timer_btn = ctk.CTkButton(btns, text="Start Timer", command=lambda: self.on_start_timer(task))
+        self.timer_btn.pack(side="left", padx=6)
 
         self.edit_btn = ctk.CTkButton(btns, text="Edit", command=lambda: self.on_edit(task))
         self.edit_btn.pack(side="left", padx=6)
@@ -324,13 +399,16 @@ class TaskCard(ctk.CTkFrame):
 
 
 class TaskEditor(ctk.CTkToplevel):
-    def __init__(self, master, task: dict, on_save):
+    def __init__(self, master, task: dict, on_save, people: list[str]):
         super().__init__(master)
         self.title("Edit Task")
-        self.geometry("520x480")
-        self.resizable(False, False)
+        self.geometry("620x640")
+        self.resizable(True, True)
         self.task = task.copy()
         self.on_save = on_save
+        initial_people = {p for p in people if p}
+        initial_people.update({task.get("who_asked", ""), task.get("assignee", "")})
+        self.people = sorted({p for p in initial_people if p})
 
         container = ctk.CTkFrame(self)
         container.pack(fill="both", expand=True, padx=16, pady=16)
@@ -352,43 +430,63 @@ class TaskEditor(ctk.CTkToplevel):
         self.pr_menu.grid(row=3, column=1, sticky="ew", pady=(0,8))
         self.pr_menu.set(task.get("priority", PRIORITIES[1]))
 
-        # Who asked
+        # Who asked & Assignee
         ctk.CTkLabel(container, text="Who asked").grid(row=4, column=0, sticky="w")
-        self.who_entry = ctk.CTkEntry(container)
-        self.who_entry.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0,8))
-        self.who_entry.insert(0, task.get("who_asked", ""))
+        self.who_entry = ctk.CTkComboBox(container, values=self._people_values(), justify="left")
+        self.who_entry.grid(row=5, column=0, sticky="ew", pady=(0,8))
+        self.who_entry.set(task.get("who_asked", ""))
+
+        ctk.CTkLabel(container, text="Assignee").grid(row=4, column=1, sticky="w")
+        self.assignee_entry = ctk.CTkComboBox(container, values=self._people_values(), justify="left")
+        self.assignee_entry.grid(row=5, column=1, sticky="ew", pady=(0,8))
+        self.assignee_entry.set(task.get("assignee", ""))
 
         # Start & Deadline (tkcalendar)
         ctk.CTkLabel(container, text="Start Date").grid(row=6, column=0, sticky="w")
-        self.start_date = DateEntry(container, date_pattern='yyyy-mm-dd')
+        self.start_date = DateEntry(container, date_pattern='yyyy-mm-dd', width=18)
         self.start_date.grid(row=7, column=0, sticky="ew", pady=(0,8))
         sd = parse_date(task.get("start_date", "")) or date.today()
         self.start_date.set_date(sd)
 
         ctk.CTkLabel(container, text="Deadline").grid(row=6, column=1, sticky="w")
-        self.deadline = DateEntry(container, date_pattern='yyyy-mm-dd')
+        self.deadline = DateEntry(container, date_pattern='yyyy-mm-dd', width=18)
         self.deadline.grid(row=7, column=1, sticky="ew", pady=(0,8))
         dl = parse_date(task.get("deadline", "")) or date.today()
         self.deadline.set_date(dl)
 
+        # Description
+        ctk.CTkLabel(container, text="Description").grid(row=8, column=0, columnspan=2, sticky="w")
+        self.description_box = ctk.CTkTextbox(container, height=160)
+        self.description_box.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(0,8))
+        self.description_box.insert("1.0", task.get("description", ""))
+
+        # Session history (read-only)
+        ctk.CTkLabel(container, text="Session history").grid(row=10, column=0, columnspan=2, sticky="w")
+        self.history_box = ctk.CTkTextbox(container, height=140)
+        self.history_box.grid(row=11, column=0, columnspan=2, sticky="nsew", pady=(0,8))
+        self.history_box.insert("1.0", self._format_sessions(task))
+        self.history_box.configure(state="disabled")
+
         # Status + Focus
-        ctk.CTkLabel(container, text="Status").grid(row=8, column=0, sticky="w")
+        ctk.CTkLabel(container, text="Status").grid(row=12, column=0, sticky="w")
         self.status_menu = ctk.CTkOptionMenu(container, values=STATUSES)
-        self.status_menu.grid(row=9, column=0, sticky="ew", pady=(0,8))
+        self.status_menu.grid(row=13, column=0, sticky="ew", pady=(0,8))
         self.status_menu.set(task.get("status", "open"))
 
         self.focus_var = tk.BooleanVar(value=task.get("focus", False))
         self.focus_chk = ctk.CTkCheckBox(container, text="Focus for Today", variable=self.focus_var)
-        self.focus_chk.grid(row=9, column=1, sticky="w")
+        self.focus_chk.grid(row=13, column=1, sticky="w")
 
         # Buttons
         btns = ctk.CTkFrame(container, fg_color="transparent")
-        btns.grid(row=10, column=0, columnspan=2, sticky="e", pady=(8,0))
+        btns.grid(row=14, column=0, columnspan=2, sticky="e", pady=(8,0))
         ctk.CTkButton(btns, text="Cancel", command=self.destroy).pack(side="right", padx=6)
         ctk.CTkButton(btns, text="Save", command=self._save).pack(side="right", padx=6)
 
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=1)
+        container.rowconfigure(9, weight=1)
+        container.rowconfigure(11, weight=1)
 
     def _save(self):
         updated = {
@@ -396,16 +494,137 @@ class TaskEditor(ctk.CTkToplevel):
             "type": self.type_menu.get(),
             "priority": self.pr_menu.get(),
             "who_asked": self.who_entry.get().strip(),
+            "assignee": self.assignee_entry.get().strip(),
             "start_date": self.start_date.get_date().strftime('%Y-%m-%d'),
             "deadline": self.deadline.get_date().strftime('%Y-%m-%d'),
             "status": self.status_menu.get(),
             "focus": bool(self.focus_var.get()),
+            "description": self.description_box.get("1.0", tk.END).strip(),
         }
         if not updated["title"]:
             messagebox.showwarning("Validation", "Title cannot be empty")
             return
         self.on_save(updated)
         self.destroy()
+
+    def _people_values(self) -> list[str]:
+        return [""] + self.people
+
+    def _format_sessions(self, task: dict) -> str:
+        sessions = task.get("sessions") or []
+        if not sessions:
+            return "No sessions recorded yet."
+        lines = []
+        for session in sessions:
+            ts = session.get("timestamp", "?")
+            minutes = session.get("minutes", 0)
+            note = session.get("note", "")
+            line = f"{ts} — {minutes} min"
+            if note:
+                line += f": {note}"
+            lines.append(line)
+        return "\n".join(lines)
+
+
+class PomodoroWindow(ctk.CTkToplevel):
+    def __init__(self, master, task: dict, on_complete, on_close):
+        super().__init__(master)
+        self.title(f"Timer — {task.get('title', 'Task')}")
+        self.geometry("360x260")
+        self.resizable(False, False)
+        self.on_complete = on_complete
+        self.on_close = on_close
+        self._after_id = None
+        self._timer_running = False
+        self._total_minutes = 0
+        self._remaining_seconds = 0
+
+        self.label = ctk.CTkLabel(self, text=f"Task: {task.get('title', '(no title)')}", wraplength=320)
+        self.label.pack(pady=(16, 8), padx=16)
+
+        entry_frame = ctk.CTkFrame(self, fg_color="transparent")
+        entry_frame.pack(pady=(0, 12))
+        ctk.CTkLabel(entry_frame, text="Minutes to focus:").pack(side="left", padx=(0, 8))
+        self.minutes_var = tk.StringVar(value="25")
+        self.minutes_entry = ctk.CTkEntry(entry_frame, textvariable=self.minutes_var, width=80)
+        self.minutes_entry.pack(side="left")
+
+        self.timer_label = ctk.CTkLabel(self, text="00:00", font=("Segoe UI", 28, "bold"))
+        self.timer_label.pack(pady=(0, 12))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=(0, 16))
+        self.start_btn = ctk.CTkButton(btn_frame, text="Start", command=self._start_timer)
+        self.start_btn.pack(side="left", padx=6)
+        self.stop_btn = ctk.CTkButton(btn_frame, text="Stop", command=self._stop_timer, state="disabled")
+        self.stop_btn.pack(side="left", padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
+
+    def _start_timer(self):
+        if self._timer_running:
+            return
+        try:
+            minutes = int(self.minutes_var.get())
+        except (TypeError, ValueError):
+            messagebox.showwarning("Timer", "Please enter a valid number of minutes.")
+            return
+        if minutes <= 0:
+            messagebox.showwarning("Timer", "Minutes must be greater than zero.")
+            return
+        self._total_minutes = minutes
+        self._remaining_seconds = minutes * 60
+        self._timer_running = True
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.minutes_entry.configure(state="disabled")
+        self._tick()
+
+    def _tick(self):
+        mins, secs = divmod(self._remaining_seconds, 60)
+        self.timer_label.configure(text=f"{mins:02d}:{secs:02d}")
+        if self._remaining_seconds <= 0:
+            self._finish_timer()
+            return
+        self._remaining_seconds -= 1
+        self._after_id = self.after(1000, self._tick)
+
+    def _finish_timer(self):
+        self._timer_running = False
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.minutes_entry.configure(state="normal")
+        if self.on_complete:
+            self.on_complete(self._total_minutes)
+        self._cleanup_and_close()
+
+    def _stop_timer(self):
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self._timer_running = False
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.minutes_entry.configure(state="normal")
+        self._cleanup_and_close()
+
+    def _on_close_request(self):
+        if self._timer_running and not messagebox.askyesno("Stop timer?", "Timer is still running. Stop it?"):
+            return
+        self._stop_timer()
+
+    def _cleanup_and_close(self):
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self._timer_running = False
+        if self.on_close:
+            self.on_close()
+        if self.winfo_exists():
+            super().destroy()
 
 
 class FocusDialog(ctk.CTkToplevel):
@@ -458,6 +677,8 @@ class TaskFocusApp(ctk.CTk):
         self.title(APP_TITLE)
         self.geometry("1100x750")
         self.minsize(950, 600)
+        self.people_options = self.store.get_people()
+        self.timer_window = None
 
         # App header
         header = ctk.CTkFrame(self)
@@ -492,6 +713,17 @@ class TaskFocusApp(ctk.CTk):
         self.tabs.set("Today's Tasks")
 
     # ----------------------- UI Builders -----------------------
+    def _people_option_values(self) -> list[str]:
+        return [""] + sorted({p for p in self.people_options if p})
+
+    def _refresh_people_options(self):
+        self.people_options = self.store.get_people()
+        values = self._people_option_values()
+        if hasattr(self, "add_who"):
+            self.add_who.configure(values=values)
+        if hasattr(self, "add_assignee"):
+            self.add_assignee.configure(values=values)
+
     def _build_today_tab(self):
         # Top bar
         top = ctk.CTkFrame(self.today_tab)
@@ -538,43 +770,80 @@ class TaskFocusApp(ctk.CTk):
         self.add_priority.grid(row=3, column=1, sticky="ew", pady=(0,8))
         self.add_priority.set(PRIORITIES[1])
 
-        # Who asked
+        # Who asked & Assignee
         ctk.CTkLabel(container, text="Who asked").grid(row=4, column=0, sticky="w")
-        self.add_who = ctk.CTkEntry(container)
-        self.add_who.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0,8))
+        self.add_who = ctk.CTkComboBox(container, values=self._people_option_values(), justify="left")
+        self.add_who.grid(row=5, column=0, sticky="ew", pady=(0,8))
+        self.add_who.set("")
+
+        ctk.CTkLabel(container, text="Assignee").grid(row=4, column=1, sticky="w")
+        self.add_assignee = ctk.CTkComboBox(container, values=self._people_option_values(), justify="left")
+        self.add_assignee.grid(row=5, column=1, sticky="ew", pady=(0,8))
+        self.add_assignee.set("")
 
         # Dates
         ctk.CTkLabel(container, text="Start Date").grid(row=6, column=0, sticky="w")
-        self.add_start = DateEntry(container, date_pattern='yyyy-mm-dd')
+        self.add_start = DateEntry(container, date_pattern='yyyy-mm-dd', width=18)
         self.add_start.grid(row=7, column=0, sticky="ew", pady=(0,8))
         self.add_start.set_date(date.today())
 
         ctk.CTkLabel(container, text="Deadline").grid(row=6, column=1, sticky="w")
-        self.add_deadline = DateEntry(container, date_pattern='yyyy-mm-dd')
+        self.add_deadline = DateEntry(container, date_pattern='yyyy-mm-dd', width=18)
         self.add_deadline.grid(row=7, column=1, sticky="ew", pady=(0,8))
         self.add_deadline.set_date(date.today())
 
+        # Description
+        ctk.CTkLabel(container, text="Description").grid(row=8, column=0, columnspan=2, sticky="w")
+        self.add_description = ctk.CTkTextbox(container, height=160)
+        self.add_description.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(0,8))
+
         # Buttons
         btns = ctk.CTkFrame(container, fg_color="transparent")
-        btns.grid(row=8, column=0, columnspan=2, sticky="e")
+        btns.grid(row=10, column=0, columnspan=2, sticky="e")
         ctk.CTkButton(btns, text="Clear", command=self._clear_add_form).pack(side="left", padx=6)
         ctk.CTkButton(btns, text="Add Task", command=self._add_task_from_form).pack(side="left", padx=6)
 
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=1)
+        container.rowconfigure(9, weight=1)
 
     def _build_bulk_tab(self):
         container = ctk.CTkFrame(self.bulk_tab)
         container.pack(fill="both", expand=True, padx=12, pady=12)
 
-        help_text = (
-            "Paste tasks using this simple template (one per line):\n"
-            "Make: Write PT summary — asked by Alex — start 2025-10-06 — deadline 2025-10-08 — priority High\n"
-            "Ask: Confirm PT rules with Devs — asked by Lena\n\n"
-            "Supported keys: asked by, start, deadline, priority.\n"
-            "Dates: yyyy-mm-dd or dd.mm.yyyy; Priority: High/Medium/Low."
+        self.bulk_instruction_text = (
+            "Use this structure when asking an AI assistant to prepare bulk tasks.\n"
+            "Each task should be on its own line using this template:\n"
+            "Type: Title — asked by <who asked> — assignee <assignee> — start <yyyy-mm-dd> — "
+            "deadline <yyyy-mm-dd> — priority <High|Medium|Low> — description <details>\n\n"
+            "Required field: Title. Optional fields may be omitted.\n"
+            "Dates accept yyyy-mm-dd or dd.mm.yyyy formats."
         )
-        ctk.CTkLabel(container, text=help_text, justify="left").pack(anchor="w", pady=(0,8))
+
+        instruct_frame = ctk.CTkFrame(container)
+        instruct_frame.pack(fill="x", pady=(0, 12))
+        ctk.CTkLabel(
+            instruct_frame,
+            text="Bulk import instructions for AI assistant",
+            font=("Segoe UI", 14, "bold"),
+        ).pack(anchor="w", padx=4, pady=(4, 2))
+        ctk.CTkLabel(
+            instruct_frame,
+            text=self.bulk_instruction_text,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 6))
+        ctk.CTkButton(
+            instruct_frame,
+            text="Copy instructions",
+            command=self._copy_bulk_instructions,
+            width=160,
+        ).pack(anchor="w", padx=4)
+
+        form_help = (
+            "Paste one task per line in the editor below. Supported fields match the Add Task form:\n"
+            "Title, Type, Priority, Who asked, Assignee, Start Date, Deadline, Description."
+        )
+        ctk.CTkLabel(container, text=form_help, justify="left").pack(anchor="w", pady=(0, 8))
 
         self.bulk_text = ctk.CTkTextbox(container, height=320)
         self.bulk_text.pack(fill="both", expand=True)
@@ -587,6 +856,7 @@ class TaskFocusApp(ctk.CTk):
 
     # ----------------------- Actions -----------------------
     def refresh_all(self):
+        self._refresh_people_options()
         self._refresh_today_list()
         self._refresh_all_list()
         self.status_label.configure(text=f"Tasks: {len(self.store.data['tasks'])}")
@@ -630,7 +900,8 @@ class TaskFocusApp(ctk.CTk):
         card = TaskCard(parent, task,
                         on_edit=self._open_editor,
                         on_done_toggle=self._toggle_done,
-                        on_focus_toggle=self._toggle_focus)
+                        on_focus_toggle=self._toggle_focus,
+                        on_start_timer=self._start_task_timer)
         card.pack(fill="x", padx=8, pady=8)
 
     def _toggle_done(self, task):
@@ -646,15 +917,49 @@ class TaskFocusApp(ctk.CTk):
         def on_save(updated):
             self.store.update_task(task["id"], updated)
             self.refresh_all()
-        TaskEditor(self, task, on_save)
+        TaskEditor(self, task, on_save, self.store.get_people())
+
+    def _start_task_timer(self, task):
+        if self.timer_window and self.timer_window.winfo_exists():
+            messagebox.showinfo("Timer", "A timer is already running. Please finish or stop it before starting another.")
+            self.timer_window.focus()
+            return
+
+        def handle_complete(minutes):
+            self._handle_timer_completion(task.get("id"), minutes)
+
+        self.timer_window = PomodoroWindow(self, task, handle_complete, self._on_timer_closed)
+        self.timer_window.focus()
+
+    def _on_timer_closed(self):
+        self.timer_window = None
+
+    def _handle_timer_completion(self, task_id: int, minutes: int):
+        self._on_timer_closed()
+        self.bell()
+        task = next((t for t in self.store.data.get("tasks", []) if t.get("id") == task_id), None)
+        if not task:
+            messagebox.showinfo("Timer", "Task no longer exists.")
+            return
+        title = task.get("title", "Task")
+        messagebox.showinfo("Time's up!", f"{minutes} minute(s) completed for '{title}'.")
+        note = simpledialog.askstring("What did you do?", "Describe what you accomplished during this focus session:")
+        if note is None:
+            note = ""
+        else:
+            note = note.strip()
+        self.store.append_session(task_id, minutes, note)
+        self.refresh_all()
 
     def _clear_add_form(self):
         self.add_title.delete(0, tk.END)
         self.add_type.set(TASK_TYPES[0])
         self.add_priority.set(PRIORITIES[1])
-        self.add_who.delete(0, tk.END)
+        self.add_who.set("")
+        self.add_assignee.set("")
         self.add_start.set_date(date.today())
         self.add_deadline.set_date(date.today())
+        self.add_description.delete("1.0", tk.END)
 
     def _add_task_from_form(self):
         title = self.add_title.get().strip()
@@ -666,10 +971,12 @@ class TaskFocusApp(ctk.CTk):
             "type": self.add_type.get(),
             "priority": self.add_priority.get(),
             "who_asked": self.add_who.get().strip(),
+            "assignee": self.add_assignee.get().strip(),
             "start_date": self.add_start.get_date().strftime('%Y-%m-%d'),
             "deadline": self.add_deadline.get_date().strftime('%Y-%m-%d'),
             "status": "open",
             "focus": False,
+            "description": self.add_description.get("1.0", tk.END).strip(),
         }
         self.store.add_task(task)
         self._clear_add_form()
@@ -710,9 +1017,11 @@ class TaskFocusApp(ctk.CTk):
         info = parts[1:]
 
         who = ""
+        assignee = ""
         start_s = today_str()
         deadline_s = ""
         pr = "Medium"
+        description = ""
 
         for seg in info:
             s = seg.strip()
@@ -720,6 +1029,11 @@ class TaskFocusApp(ctk.CTk):
             m1 = re.match(r"(?i)^asked\s+by\s*:?\s*(.+)$", s)
             if m1:
                 who = m1.group(1).strip()
+                continue
+            # key: assignee / assigned to
+            m1b = re.match(r"(?i)^(assignee|assigned\s+to)\s*:?\s*(.+)$", s)
+            if m1b:
+                assignee = m1b.group(2).strip()
                 continue
             # key: start date
             m2 = re.match(r"(?i)^start\s*:?\s*(.+)$", s)
@@ -740,6 +1054,11 @@ class TaskFocusApp(ctk.CTk):
             if m4:
                 pr = m4.group(1).capitalize()
                 continue
+            # key: description / notes
+            m5 = re.match(r"(?i)^(description|desc|notes?)\s*:?\s*(.+)$", s)
+            if m5:
+                description = m5.group(2).strip()
+                continue
 
         if ttype not in TASK_TYPES:
             ttype = TASK_TYPES[0]
@@ -751,11 +1070,21 @@ class TaskFocusApp(ctk.CTk):
             "type": ttype,
             "priority": pr,
             "who_asked": who,
+            "assignee": assignee,
             "start_date": start_s,
             "deadline": deadline_s,
             "status": "open",
-            "focus": False
+            "focus": False,
+            "description": description,
         }
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
 
     def _prompt_focus_selection(self):
         tasks = self.store.eligible_today()
