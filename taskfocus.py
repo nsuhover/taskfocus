@@ -26,7 +26,7 @@ import re
 from datetime import datetime, date
 
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox
 
 try:
     import customtkinter as ctk
@@ -154,6 +154,91 @@ def sort_key(task: dict):
     except Exception:
         created = datetime(2099, 1, 1)
     return (pr, dl, sd, created)
+
+
+def create_dark_date_entry(master) -> DateEntry:
+    """Return a DateEntry that matches the dark UI theme."""
+    entry = DateEntry(
+        master,
+        date_pattern='yyyy-mm-dd',
+        font=("Segoe UI", 14),
+        background="#1E1B4B",
+        foreground="#E5E7EB",
+        borderwidth=0,
+        width=16,
+        selectbackground="#8B5CF6",
+        selectforeground="#F9FAFB",
+        fieldbackground="#111827",
+        normalbackground="#1E1B4B",
+        normalforeground="#F9FAFB",
+        headersbackground="#312E81",
+        headersforeground="#E5E7EB",
+    )
+    entry.configure(
+        insertbackground="#F9FAFB",
+        disabledbackground="#1F2937",
+        disabledforeground="#6B7280",
+    )
+    try:
+        cal = entry._top_cal  # type: ignore[attr-defined]
+        cal.configure(
+            background="#111827",
+            foreground="#F9FAFB",
+            selectbackground="#8B5CF6",
+            selectforeground="#F9FAFB",
+            headersbackground="#312E81",
+            headersforeground="#E5E7EB",
+            weekendbackground="#1E1B4B",
+            weekendforeground="#F3F4F6",
+            othermonthbackground="#111827",
+            othermonthforeground="#6B7280",
+            disableddaybackground="#1F2937",
+            disableddayforeground="#6B7280",
+        )
+        try:
+            cal.configure(font=("Segoe UI", 12))
+        except tk.TclError:
+            pass
+    except Exception:
+        # Fallback quietly if tkcalendar internals change.
+        pass
+    return entry
+
+
+def parse_minutes_input(raw: str) -> int:
+    """Parse flexible minute input supporting m, h, and H:MM formats."""
+    if raw is None:
+        raise ValueError("No time entered")
+    value = raw.strip().lower().replace(" ", "")
+    if not value:
+        raise ValueError("No time entered")
+
+    try:
+        if ":" in value:
+            hours_str, mins_str = value.split(":", 1)
+            hours = int(hours_str.strip() or 0)
+            minutes = int(mins_str.strip() or 0)
+            total = hours * 60 + minutes
+        elif "h" in value:
+            hours_part, minutes_part = value.split("h", 1)
+            hours = float(hours_part) if hours_part else 0.0
+            minutes_text = minutes_part.replace("m", "") if minutes_part else ""
+            minutes = float(minutes_text) if minutes_text else 0.0
+            total = int(round(hours * 60 + minutes))
+        else:
+            suffix = value[-1] if value[-1].isalpha() else ""
+            number_part = value[:-1] if suffix else value
+            amount = float(number_part)
+            if suffix == "h":
+                total = int(round(amount * 60))
+            else:
+                total = int(round(amount))
+    except (TypeError, ValueError):
+        raise ValueError("Invalid time format") from None
+
+    if total <= 0:
+        raise ValueError("Time must be greater than zero")
+    return total
 
 
 # -------------------------------
@@ -445,6 +530,47 @@ class TaskStore:
                 return session_entry
         return None
 
+    def register_people(self, *names: str | None):
+        names_clean = [n.strip() for n in names if n and n.strip()]
+        if not names_clean:
+            return
+        current = set(self.data.get("meta", {}).get("people", []))
+        updated = False
+        for name in names_clean:
+            if name not in current:
+                current.add(name)
+                updated = True
+        if updated:
+            self.data["meta"]["people"] = sorted(current)
+
+    def get_people(self) -> list[str]:
+        return list(self.data.get("meta", {}).get("people", []))
+
+    def append_session(self, task_id: int, minutes: int, note: str):
+        for t in self.data.get("tasks", []):
+            if t.get("id") == task_id:
+                self._ensure_task_defaults(t)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                session_entry = {
+                    "timestamp": timestamp,
+                    "minutes": minutes,
+                    "note": note,
+                }
+                t["sessions"].append(session_entry)
+                t["time_spent_minutes"] = int(t.get("time_spent_minutes", 0)) + int(minutes)
+                addition = f"[{timestamp}] ({minutes} min)"
+                if note:
+                    addition += f" {note}"
+                existing = t.get("description", "").rstrip()
+                if existing:
+                    new_desc = existing + "\n" + addition
+                else:
+                    new_desc = addition
+                t["description"] = new_desc
+                self.save()
+                return session_entry
+        return None
+
     def eligible_today(self):
         today = date.today()
         return [
@@ -475,23 +601,40 @@ class TaskStore:
 # GUI Components
 # -------------------------------
 class TaskCard(ctk.CTkFrame):
-    def __init__(self, master, task: dict, on_edit, on_done_toggle, on_focus_toggle, on_start_timer):
+    def __init__(
+        self,
+        master,
+        task: dict,
+        on_edit,
+        on_done_toggle,
+        on_focus_toggle,
+        on_start_timer,
+        on_log_time,
+    ):
         super().__init__(master)
         self.task = task
         self.on_edit = on_edit
         self.on_done_toggle = on_done_toggle
         self.on_focus_toggle = on_focus_toggle
         self.on_start_timer = on_start_timer
+        self.on_log_time = on_log_time
+        self._layout_mode: str | None = None
 
         # Left labels container
-        left = ctk.CTkFrame(self, fg_color="transparent")
-        left.grid(row=0, column=0, sticky="w", padx=(12, 6), pady=12)
+        self.left_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.left_frame.grid(row=0, column=0, sticky="ew", padx=(12, 6), pady=12)
 
-        title_row = ctk.CTkFrame(left, fg_color="transparent")
-        title_row.pack(anchor="w")
+        title_row = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        title_row.pack(anchor="w", fill="x")
 
         focus_prefix = "⭐ " if task.get("focus") else ""
-        self.title_label = ctk.CTkLabel(title_row, text=f"{focus_prefix}{task.get('title','(no title)')}", font=("Segoe UI", 16, "bold"))
+        self.title_label = ctk.CTkLabel(
+            title_row,
+            text=f"{focus_prefix}{task.get('title','(no title)')}",
+            font=("Segoe UI", 16, "bold"),
+            justify="left",
+            anchor="w",
+        )
         self.title_label.pack(side="left", padx=(0, 6))
 
         # Priority badge
@@ -499,9 +642,8 @@ class TaskCard(ctk.CTkFrame):
         pr_color = {
             "High": "#F97316",  # orange
             "Medium": "#A78BFA",  # purple-light
-            "Low": "#64748B"     # slate
+            "Low": "#64748B",    # slate
         }.get(pr, "#A78BFA")
-        # Padding the badge text itself keeps spacing without unsupported pad options.
         pr_badge = ctk.CTkLabel(
             title_row,
             text=f" {pr} ",
@@ -532,7 +674,6 @@ class TaskCard(ctk.CTkFrame):
             meta.append(f"Time spent: {time_text}")
         sd = task.get("start_date") or "—"
         dl = task.get("deadline") or "—"
-        # Overdue visual hint
         overdue = False
         if task.get("status") == "open" and parse_date(task.get("deadline", "")):
             if parse_date(task.get("deadline")) < date.today():
@@ -545,28 +686,62 @@ class TaskCard(ctk.CTkFrame):
             meta_text = f"{top_line}\nStart: {sd} | {dl_text}"
         else:
             meta_text = f"Start: {sd} | {dl_text}"
-        meta_line = ctk.CTkLabel(left, text=meta_text, justify="left")
-        meta_line.pack(anchor="w", pady=(6, 0))
+        self.meta_line = ctk.CTkLabel(self.left_frame, text=meta_text, justify="left", anchor="w")
+        self.meta_line.pack(anchor="w", pady=(6, 0))
 
         # Right buttons
-        btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=0, column=1, sticky="e", padx=(6, 12), pady=12)
+        self.btns_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.btns_frame.grid(row=0, column=1, sticky="e", padx=(6, 12), pady=12)
 
         focus_text = "Unfocus" if task.get("focus") else "Focus ⭐"
-        self.focus_btn = ctk.CTkButton(btns, text=focus_text, command=lambda: self.on_focus_toggle(task))
-        self.focus_btn.pack(side="left", padx=6)
-
-        self.timer_btn = ctk.CTkButton(btns, text="Start Timer", command=lambda: self.on_start_timer(task))
-        self.timer_btn.pack(side="left", padx=6)
-
-        self.edit_btn = ctk.CTkButton(btns, text="Edit", command=lambda: self.on_edit(task))
-        self.edit_btn.pack(side="left", padx=6)
-
+        self.focus_btn = ctk.CTkButton(self.btns_frame, text=focus_text, command=lambda: self.on_focus_toggle(task))
+        self.timer_btn = ctk.CTkButton(self.btns_frame, text="Start Timer", command=lambda: self.on_start_timer(task))
+        self.log_btn = ctk.CTkButton(self.btns_frame, text="Log Time", command=lambda: self.on_log_time(task))
+        self.edit_btn = ctk.CTkButton(self.btns_frame, text="Edit", command=lambda: self.on_edit(task))
         done_text = "Mark Open" if task.get("status") == "done" else "Mark Done"
-        self.done_btn = ctk.CTkButton(btns, text=done_text, command=lambda: self.on_done_toggle(task))
-        self.done_btn.pack(side="left", padx=6)
+        self.done_btn = ctk.CTkButton(self.btns_frame, text=done_text, command=lambda: self.on_done_toggle(task))
+
+        self._buttons = [
+            self.focus_btn,
+            self.timer_btn,
+            self.log_btn,
+            self.edit_btn,
+            self.done_btn,
+        ]
+        self._arrange_buttons("inline")
 
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.bind("<Configure>", self._on_configure)
+
+    def _arrange_buttons(self, mode: str):
+        for btn in self._buttons:
+            btn.pack_forget()
+        if mode == "stacked":
+            for btn in self._buttons:
+                btn.pack(fill="x", padx=4, pady=4)
+        else:
+            for btn in self._buttons:
+                btn.pack(side="left", padx=6)
+        self._layout_mode = mode
+
+    def _on_configure(self, _event=None):
+        width = max(self.winfo_width(), 1)
+        wrap = max(width - 220, 260)
+        self.title_label.configure(wraplength=wrap)
+        self.meta_line.configure(wraplength=wrap)
+
+        mode = "stacked" if width < 1100 else "inline"
+        if mode != self._layout_mode:
+            if mode == "stacked":
+                self.left_frame.grid_configure(row=0, column=0, columnspan=2, sticky="ew", padx=(12, 12), pady=(12, 6))
+                self.btns_frame.grid_configure(row=1, column=0, columnspan=2, sticky="ew", padx=(12, 12), pady=(0, 12))
+                self._arrange_buttons("stacked")
+            else:
+                self.left_frame.grid_configure(row=0, column=0, columnspan=1, sticky="ew", padx=(12, 6), pady=12)
+                self.btns_frame.grid_configure(row=0, column=1, columnspan=1, sticky="e", padx=(6, 12), pady=12)
+                self._arrange_buttons("inline")
 
 
 class TaskEditor(ctk.CTkToplevel):
@@ -614,13 +789,13 @@ class TaskEditor(ctk.CTkToplevel):
 
         # Start & Deadline (tkcalendar)
         ctk.CTkLabel(container, text="Start Date").grid(row=6, column=0, sticky="w")
-        self.start_date = DateEntry(container, date_pattern='yyyy-mm-dd', width=18)
+        self.start_date = create_dark_date_entry(container)
         self.start_date.grid(row=7, column=0, sticky="ew", pady=(0,8))
         sd = parse_date(task.get("start_date", "")) or date.today()
         self.start_date.set_date(sd)
 
         ctk.CTkLabel(container, text="Deadline").grid(row=6, column=1, sticky="w")
-        self.deadline = DateEntry(container, date_pattern='yyyy-mm-dd', width=18)
+        self.deadline = create_dark_date_entry(container)
         self.deadline.grid(row=7, column=1, sticky="ew", pady=(0,8))
         dl = parse_date(task.get("deadline", "")) or date.today()
         self.deadline.set_date(dl)
@@ -677,6 +852,212 @@ class TaskEditor(ctk.CTkToplevel):
             return
         self.on_save(updated)
         self.destroy()
+
+    def _people_values(self) -> list[str]:
+        return [""] + self.people
+
+    def _format_sessions(self, task: dict) -> str:
+        sessions = task.get("sessions") or []
+        if not sessions:
+            return "No sessions recorded yet."
+        lines = []
+        for session in sessions:
+            ts = session.get("timestamp", "?")
+            minutes = session.get("minutes", 0)
+            note = session.get("note", "")
+            line = f"{ts} — {minutes} min"
+            if note:
+                line += f": {note}"
+            lines.append(line)
+        return "\n".join(lines)
+
+
+class SessionLogDialog(ctk.CTkToplevel):
+    def __init__(
+        self,
+        master,
+        *,
+        title: str,
+        preset_minutes: int | None = None,
+        allow_minutes_edit: bool = True,
+        prompt: str,
+    ):
+        super().__init__(master)
+        self.title(title)
+        self.geometry("540x440")
+        self.minsize(480, 360)
+        self.transient(master)
+        self.grab_set()
+        self.result: tuple[int, str] | None = None
+
+        container = ctk.CTkFrame(self)
+        container.pack(fill="both", expand=True, padx=18, pady=18)
+
+        time_label = ctk.CTkLabel(container, text="Minutes spent", font=("Segoe UI", 14, "bold"))
+        time_label.pack(anchor="w")
+
+        self.minutes_var = tk.StringVar()
+        if preset_minutes is not None:
+            self.minutes_var.set(str(preset_minutes))
+        self.error_label = ctk.CTkLabel(container, text="", text_color="#F87171")
+        self.minutes_entry = ctk.CTkEntry(container, textvariable=self.minutes_var, font=("Segoe UI", 14))
+        self.minutes_entry.pack(fill="x", pady=(4, 12))
+        if not allow_minutes_edit and preset_minutes is not None:
+            self.minutes_entry.configure(state="disabled")
+        else:
+            self.minutes_var.trace_add("write", lambda *_: self.error_label.configure(text=""))
+
+        ctk.CTkLabel(
+            container,
+            text=prompt,
+            justify="left",
+            anchor="w",
+        ).pack(anchor="w")
+
+        self.note_box = ctk.CTkTextbox(container, height=220)
+        self.note_box.configure(font=("Segoe UI", 13), wrap="word")
+        self.note_box.pack(fill="both", expand=True, pady=(8, 12))
+
+        self.error_label.pack(anchor="w", pady=(0, 8))
+
+        btns = ctk.CTkFrame(container, fg_color="transparent")
+        btns.pack(fill="x")
+        ctk.CTkButton(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
+        ctk.CTkButton(btns, text="Save", command=self._submit).pack(side="right", padx=6)
+
+        if allow_minutes_edit and preset_minutes is None:
+            self.minutes_entry.focus_set()
+        else:
+            self.note_box.focus_set()
+
+        self.bind("<Return>", self._submit_event)
+        self.bind("<Escape>", self._cancel_event)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def show(self) -> tuple[int, str] | None:
+        self.wait_window()
+        return self.result
+
+    def _submit_event(self, _event=None):
+        self._submit()
+
+    def _cancel_event(self, _event=None):
+        self._cancel()
+
+    def _submit(self):
+        try:
+            minutes = parse_minutes_input(self.minutes_var.get())
+        except ValueError as exc:
+            self.error_label.configure(text=str(exc))
+            return
+        note = self.note_box.get("1.0", tk.END).strip()
+        self.result = (minutes, note)
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class PomodoroWindow(ctk.CTkToplevel):
+    def __init__(self, master, task: dict, on_complete, on_close):
+        super().__init__(master)
+        self.title(f"Timer — {task.get('title', 'Task')}")
+        self.geometry("360x260")
+        self.resizable(False, False)
+        self.on_complete = on_complete
+        self.on_close = on_close
+        self._after_id = None
+        self._timer_running = False
+        self._total_minutes = 0
+        self._remaining_seconds = 0
+
+        self.label = ctk.CTkLabel(self, text=f"Task: {task.get('title', '(no title)')}", wraplength=320)
+        self.label.pack(pady=(16, 8), padx=16)
+
+        entry_frame = ctk.CTkFrame(self, fg_color="transparent")
+        entry_frame.pack(pady=(0, 12))
+        ctk.CTkLabel(entry_frame, text="Minutes to focus:").pack(side="left", padx=(0, 8))
+        self.minutes_var = tk.StringVar(value="25")
+        self.minutes_entry = ctk.CTkEntry(entry_frame, textvariable=self.minutes_var, width=80)
+        self.minutes_entry.pack(side="left")
+
+        self.timer_label = ctk.CTkLabel(self, text="00:00", font=("Segoe UI", 28, "bold"))
+        self.timer_label.pack(pady=(0, 12))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=(0, 16))
+        self.start_btn = ctk.CTkButton(btn_frame, text="Start", command=self._start_timer)
+        self.start_btn.pack(side="left", padx=6)
+        self.stop_btn = ctk.CTkButton(btn_frame, text="Stop", command=self._stop_timer, state="disabled")
+        self.stop_btn.pack(side="left", padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
+
+    def _start_timer(self):
+        if self._timer_running:
+            return
+        try:
+            minutes = int(self.minutes_var.get())
+        except (TypeError, ValueError):
+            messagebox.showwarning("Timer", "Please enter a valid number of minutes.")
+            return
+        if minutes <= 0:
+            messagebox.showwarning("Timer", "Minutes must be greater than zero.")
+            return
+        self._total_minutes = minutes
+        self._remaining_seconds = minutes * 60
+        self._timer_running = True
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.minutes_entry.configure(state="disabled")
+        self._tick()
+
+    def _tick(self):
+        mins, secs = divmod(self._remaining_seconds, 60)
+        self.timer_label.configure(text=f"{mins:02d}:{secs:02d}")
+        if self._remaining_seconds <= 0:
+            self._finish_timer()
+            return
+        self._remaining_seconds -= 1
+        self._after_id = self.after(1000, self._tick)
+
+    def _finish_timer(self):
+        self._timer_running = False
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.minutes_entry.configure(state="normal")
+        if self.on_complete:
+            self.on_complete(self._total_minutes)
+        self._cleanup_and_close()
+
+    def _stop_timer(self):
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self._timer_running = False
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.minutes_entry.configure(state="normal")
+        self._cleanup_and_close()
+
+    def _on_close_request(self):
+        if self._timer_running and not messagebox.askyesno("Stop timer?", "Timer is still running. Stop it?"):
+            return
+        self._stop_timer()
+
+    def _cleanup_and_close(self):
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self._timer_running = False
+        if self.on_close:
+            self.on_close()
+        if self.winfo_exists():
+            super().destroy()
 
     def _people_values(self) -> list[str]:
         return [""] + self.people
@@ -1193,11 +1574,11 @@ class TaskFocusApp(ctk.CTk):
         self.add_assignee.set("")
 
         self.add_start_label = ctk.CTkLabel(container, text="Start Date")
-        self.add_start = DateEntry(container, date_pattern='yyyy-mm-dd', width=18)
+        self.add_start = create_dark_date_entry(container)
         self.add_start.set_date(date.today())
 
         self.add_deadline_label = ctk.CTkLabel(container, text="Deadline")
-        self.add_deadline = DateEntry(container, date_pattern='yyyy-mm-dd', width=18)
+        self.add_deadline = create_dark_date_entry(container)
         self.add_deadline.set_date(date.today())
 
         self.add_description_label = ctk.CTkLabel(container, text="Description")
@@ -1388,14 +1769,16 @@ class TaskFocusApp(ctk.CTk):
             self.bulk_form_help_label.configure(wraplength=wrap)
 
     def _apply_scaling(self, width: int):
-        if width >= 1200:
+        if width >= 1500:
+            scale = 1.05
+        elif width >= 1020:
             scale = 1.0
-        elif width >= 1000:
-            scale = 0.95
-        elif width >= 820:
-            scale = 0.9
+        elif width >= 900:
+            scale = 0.96
+        elif width >= 780:
+            scale = 0.92
         else:
-            scale = 0.85
+            scale = 0.88
 
         if self._widget_scale == scale:
             return
@@ -1454,7 +1837,8 @@ class TaskFocusApp(ctk.CTk):
                         on_edit=self._open_editor,
                         on_done_toggle=self._toggle_done,
                         on_focus_toggle=self._toggle_focus,
-                        on_start_timer=self._start_task_timer)
+                        on_start_timer=self._start_task_timer,
+                        on_log_time=self._log_manual_time)
         card.pack(fill="x", padx=8, pady=8)
 
     def _toggle_done(self, task):
@@ -1496,11 +1880,37 @@ class TaskFocusApp(ctk.CTk):
             return
         title = task.get("title", "Task")
         messagebox.showinfo("Time's up!", f"{minutes} minute(s) completed for '{title}'.")
-        note = simpledialog.askstring("What did you do?", "Describe what you accomplished during this focus session:")
-        if note is None:
-            note = ""
+        dialog = SessionLogDialog(
+            self,
+            title=f"Session recap — {title}",
+            preset_minutes=minutes,
+            allow_minutes_edit=True,
+            prompt="Describe what you accomplished during this focus session:",
+        )
+        result = dialog.show()
+        if result:
+            minutes_logged, note = result
         else:
-            note = note.strip()
+            minutes_logged, note = minutes, ""
+        self.store.append_session(task_id, minutes_logged, note)
+        self.refresh_all()
+
+    def _log_manual_time(self, task):
+        task_id = task.get("id") if task else None
+        if not task_id:
+            return
+        title = task.get("title", "Task")
+        dialog = SessionLogDialog(
+            self,
+            title=f"Log time — {title}",
+            preset_minutes=None,
+            allow_minutes_edit=True,
+            prompt="Enter how long you worked (e.g. 90, 1:30, 1.5h) and describe what happened:",
+        )
+        result = dialog.show()
+        if not result:
+            return
+        minutes, note = result
         self.store.append_session(task_id, minutes, note)
         self.refresh_all()
 
@@ -1630,6 +2040,14 @@ class TaskFocusApp(ctk.CTk):
             "focus": False,
             "description": description,
         }
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
 
     def _copy_bulk_instructions(self):
         try:
