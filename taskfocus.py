@@ -404,6 +404,47 @@ class TaskStore:
                 return session_entry
         return None
 
+    def register_people(self, *names: str | None):
+        names_clean = [n.strip() for n in names if n and n.strip()]
+        if not names_clean:
+            return
+        current = set(self.data.get("meta", {}).get("people", []))
+        updated = False
+        for name in names_clean:
+            if name not in current:
+                current.add(name)
+                updated = True
+        if updated:
+            self.data["meta"]["people"] = sorted(current)
+
+    def get_people(self) -> list[str]:
+        return list(self.data.get("meta", {}).get("people", []))
+
+    def append_session(self, task_id: int, minutes: int, note: str):
+        for t in self.data.get("tasks", []):
+            if t.get("id") == task_id:
+                self._ensure_task_defaults(t)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                session_entry = {
+                    "timestamp": timestamp,
+                    "minutes": minutes,
+                    "note": note,
+                }
+                t["sessions"].append(session_entry)
+                t["time_spent_minutes"] = int(t.get("time_spent_minutes", 0)) + int(minutes)
+                addition = f"[{timestamp}] ({minutes} min)"
+                if note:
+                    addition += f" {note}"
+                existing = t.get("description", "").rstrip()
+                if existing:
+                    new_desc = existing + "\n" + addition
+                else:
+                    new_desc = addition
+                t["description"] = new_desc
+                self.save()
+                return session_entry
+        return None
+
     def eligible_today(self):
         today = date.today()
         return [
@@ -875,6 +916,125 @@ class PomodoroWindow(ctk.CTkToplevel):
         if self.winfo_exists():
             super().destroy()
 
+    def _people_values(self) -> list[str]:
+        return [""] + self.people
+
+    def _format_sessions(self, task: dict) -> str:
+        sessions = task.get("sessions") or []
+        if not sessions:
+            return "No sessions recorded yet."
+        lines = []
+        for session in sessions:
+            ts = session.get("timestamp", "?")
+            minutes = session.get("minutes", 0)
+            note = session.get("note", "")
+            line = f"{ts} — {minutes} min"
+            if note:
+                line += f": {note}"
+            lines.append(line)
+        return "\n".join(lines)
+
+
+class PomodoroWindow(ctk.CTkToplevel):
+    def __init__(self, master, task: dict, on_complete, on_close):
+        super().__init__(master)
+        self.title(f"Timer — {task.get('title', 'Task')}")
+        self.geometry("360x260")
+        self.resizable(False, False)
+        self.on_complete = on_complete
+        self.on_close = on_close
+        self._after_id = None
+        self._timer_running = False
+        self._total_minutes = 0
+        self._remaining_seconds = 0
+
+        self.label = ctk.CTkLabel(self, text=f"Task: {task.get('title', '(no title)')}", wraplength=320)
+        self.label.pack(pady=(16, 8), padx=16)
+
+        entry_frame = ctk.CTkFrame(self, fg_color="transparent")
+        entry_frame.pack(pady=(0, 12))
+        ctk.CTkLabel(entry_frame, text="Minutes to focus:").pack(side="left", padx=(0, 8))
+        self.minutes_var = tk.StringVar(value="25")
+        self.minutes_entry = ctk.CTkEntry(entry_frame, textvariable=self.minutes_var, width=80)
+        self.minutes_entry.pack(side="left")
+
+        self.timer_label = ctk.CTkLabel(self, text="00:00", font=("Segoe UI", 28, "bold"))
+        self.timer_label.pack(pady=(0, 12))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=(0, 16))
+        self.start_btn = ctk.CTkButton(btn_frame, text="Start", command=self._start_timer)
+        self.start_btn.pack(side="left", padx=6)
+        self.stop_btn = ctk.CTkButton(btn_frame, text="Stop", command=self._stop_timer, state="disabled")
+        self.stop_btn.pack(side="left", padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
+
+    def _start_timer(self):
+        if self._timer_running:
+            return
+        try:
+            minutes = int(self.minutes_var.get())
+        except (TypeError, ValueError):
+            messagebox.showwarning("Timer", "Please enter a valid number of minutes.")
+            return
+        if minutes <= 0:
+            messagebox.showwarning("Timer", "Minutes must be greater than zero.")
+            return
+        self._total_minutes = minutes
+        self._remaining_seconds = minutes * 60
+        self._timer_running = True
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.minutes_entry.configure(state="disabled")
+        self._tick()
+
+    def _tick(self):
+        mins, secs = divmod(self._remaining_seconds, 60)
+        self.timer_label.configure(text=f"{mins:02d}:{secs:02d}")
+        if self._remaining_seconds <= 0:
+            self._finish_timer()
+            return
+        self._remaining_seconds -= 1
+        self._after_id = self.after(1000, self._tick)
+
+    def _finish_timer(self):
+        self._timer_running = False
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.minutes_entry.configure(state="normal")
+        if self.on_complete:
+            self.on_complete(self._total_minutes)
+        self._cleanup_and_close()
+
+    def _stop_timer(self):
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self._timer_running = False
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.minutes_entry.configure(state="normal")
+        self._cleanup_and_close()
+
+    def _on_close_request(self):
+        if self._timer_running and not messagebox.askyesno("Stop timer?", "Timer is still running. Stop it?"):
+            return
+        self._stop_timer()
+
+    def _cleanup_and_close(self):
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self._timer_running = False
+        if self.on_close:
+            self.on_close()
+        if self.winfo_exists():
+            super().destroy()
+
 
 class FocusDialog(ctk.CTkToplevel):
     def __init__(self, master, tasks_sorted, on_confirm):
@@ -925,9 +1085,15 @@ class TaskFocusApp(ctk.CTk):
         self.store = store
         self.title(APP_TITLE)
         self.geometry("1100x750")
-        self.minsize(950, 600)
+        self.minsize(720, 520)
         self.people_options = self.store.get_people()
         self.timer_window = None
+        self._layout_mode: str | None = None
+        self._widget_scale: float | None = None
+        self._responsive_after: str | None = None
+        self._pending_width: int | None = None
+
+        self.bind("<Configure>", self._on_window_configure)
 
         # App header
         header = ctk.CTkFrame(self)
@@ -960,6 +1126,9 @@ class TaskFocusApp(ctk.CTk):
 
         # Start on Today's tab
         self.tabs.set("Today's Tasks")
+
+        # Apply responsive layout/sizing after widgets are drawn
+        self.after(150, self._initialize_responsive_layout)
 
     # ----------------------- UI Builders -----------------------
     def _people_option_values(self) -> list[str]:
@@ -1002,71 +1171,143 @@ class TaskFocusApp(ctk.CTk):
     def _build_add_tab(self):
         container = ctk.CTkFrame(self.add_tab)
         container.pack(fill="both", expand=True, padx=12, pady=12)
+        self.add_container = container
 
-        # Title
-        ctk.CTkLabel(container, text="Title").grid(row=0, column=0, sticky="w")
+        self.add_title_label = ctk.CTkLabel(container, text="Title")
         self.add_title = ctk.CTkEntry(container)
-        self.add_title.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0,8))
 
-        # Type & Priority
-        ctk.CTkLabel(container, text="Type").grid(row=2, column=0, sticky="w")
+        self.add_type_label = ctk.CTkLabel(container, text="Type")
         self.add_type = ctk.CTkOptionMenu(container, values=TASK_TYPES)
-        self.add_type.grid(row=3, column=0, sticky="ew", pady=(0,8))
         self.add_type.set(TASK_TYPES[0])
 
-        ctk.CTkLabel(container, text="Priority").grid(row=2, column=1, sticky="w")
+        self.add_priority_label = ctk.CTkLabel(container, text="Priority")
         self.add_priority = ctk.CTkOptionMenu(container, values=PRIORITIES)
-        self.add_priority.grid(row=3, column=1, sticky="ew", pady=(0,8))
         self.add_priority.set(PRIORITIES[1])
 
-        # Who asked & Assignee
-        ctk.CTkLabel(container, text="Who asked").grid(row=4, column=0, sticky="w")
+        self.add_who_label = ctk.CTkLabel(container, text="Who asked")
         self.add_who = ctk.CTkComboBox(container, values=self._people_option_values(), justify="left")
-        self.add_who.grid(row=5, column=0, sticky="ew", pady=(0,8))
         self.add_who.set("")
 
-        ctk.CTkLabel(container, text="Assignee").grid(row=4, column=1, sticky="w")
+        self.add_assignee_label = ctk.CTkLabel(container, text="Assignee")
         self.add_assignee = ctk.CTkComboBox(container, values=self._people_option_values(), justify="left")
-        self.add_assignee.grid(row=5, column=1, sticky="ew", pady=(0,8))
         self.add_assignee.set("")
 
-        # Dates
-        ctk.CTkLabel(container, text="Start Date").grid(row=6, column=0, sticky="w")
+        self.add_start_label = ctk.CTkLabel(container, text="Start Date")
         self.add_start = DateEntry(container, date_pattern='yyyy-mm-dd', width=18)
-        self.add_start.grid(row=7, column=0, sticky="ew", pady=(0,8))
         self.add_start.set_date(date.today())
 
-        ctk.CTkLabel(container, text="Deadline").grid(row=6, column=1, sticky="w")
+        self.add_deadline_label = ctk.CTkLabel(container, text="Deadline")
         self.add_deadline = DateEntry(container, date_pattern='yyyy-mm-dd', width=18)
-        self.add_deadline.grid(row=7, column=1, sticky="ew", pady=(0,8))
         self.add_deadline.set_date(date.today())
 
-        # Description
-        ctk.CTkLabel(container, text="Description").grid(row=8, column=0, columnspan=2, sticky="w")
+        self.add_description_label = ctk.CTkLabel(container, text="Description")
         self.add_description = ctk.CTkTextbox(container, height=160)
-        self.add_description.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(0,8))
 
-        # Buttons
-        btns = ctk.CTkFrame(container, fg_color="transparent")
-        btns.grid(row=10, column=0, columnspan=2, sticky="e")
-        ctk.CTkButton(btns, text="Clear", command=self._clear_add_form).pack(side="left", padx=6)
-        ctk.CTkButton(btns, text="Add Task", command=self._add_task_from_form).pack(side="left", padx=6)
+        self.add_button_row = ctk.CTkFrame(container, fg_color="transparent")
+        ctk.CTkButton(self.add_button_row, text="Clear", command=self._clear_add_form).pack(side="left", padx=6)
+        ctk.CTkButton(self.add_button_row, text="Add Task", command=self._add_task_from_form).pack(side="left", padx=6)
 
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=1)
-        container.rowconfigure(9, weight=1)
+
+        self._layout_add_form("wide")
+
+    def _layout_add_form(self, mode: str):
+        container = self.add_container
+        widgets = [
+            self.add_title_label,
+            self.add_title,
+            self.add_type_label,
+            self.add_type,
+            self.add_priority_label,
+            self.add_priority,
+            self.add_who_label,
+            self.add_who,
+            self.add_assignee_label,
+            self.add_assignee,
+            self.add_start_label,
+            self.add_start,
+            self.add_deadline_label,
+            self.add_deadline,
+            self.add_description_label,
+            self.add_description,
+            self.add_button_row,
+        ]
+        for w in widgets:
+            w.grid_forget()
+
+        for idx in range(0, 20):
+            container.rowconfigure(idx, weight=0)
+
+        if mode == "narrow":
+            container.grid_columnconfigure(0, weight=1)
+            container.grid_columnconfigure(1, weight=0)
+            placements = [
+                (self.add_title_label, {"row": 0, "column": 0, "sticky": "w"}),
+                (self.add_title, {"row": 1, "column": 0, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_type_label, {"row": 2, "column": 0, "sticky": "w"}),
+                (self.add_type, {"row": 3, "column": 0, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_priority_label, {"row": 4, "column": 0, "sticky": "w"}),
+                (self.add_priority, {"row": 5, "column": 0, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_who_label, {"row": 6, "column": 0, "sticky": "w"}),
+                (self.add_who, {"row": 7, "column": 0, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_assignee_label, {"row": 8, "column": 0, "sticky": "w"}),
+                (self.add_assignee, {"row": 9, "column": 0, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_start_label, {"row": 10, "column": 0, "sticky": "w"}),
+                (self.add_start, {"row": 11, "column": 0, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_deadline_label, {"row": 12, "column": 0, "sticky": "w"}),
+                (self.add_deadline, {"row": 13, "column": 0, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_description_label, {"row": 14, "column": 0, "sticky": "w"}),
+                (self.add_description, {"row": 15, "column": 0, "sticky": "nsew", "pady": (0, 8)}),
+                (self.add_button_row, {"row": 16, "column": 0, "sticky": "e"}),
+            ]
+            target_row = 15
+        else:
+            container.grid_columnconfigure(0, weight=1)
+            container.grid_columnconfigure(1, weight=1)
+            placements = [
+                (self.add_title_label, {"row": 0, "column": 0, "columnspan": 2, "sticky": "w"}),
+                (self.add_title, {"row": 1, "column": 0, "columnspan": 2, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_type_label, {"row": 2, "column": 0, "sticky": "w"}),
+                (self.add_priority_label, {"row": 2, "column": 1, "sticky": "w"}),
+                (self.add_type, {"row": 3, "column": 0, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_priority, {"row": 3, "column": 1, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_who_label, {"row": 4, "column": 0, "sticky": "w"}),
+                (self.add_assignee_label, {"row": 4, "column": 1, "sticky": "w"}),
+                (self.add_who, {"row": 5, "column": 0, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_assignee, {"row": 5, "column": 1, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_start_label, {"row": 6, "column": 0, "sticky": "w"}),
+                (self.add_deadline_label, {"row": 6, "column": 1, "sticky": "w"}),
+                (self.add_start, {"row": 7, "column": 0, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_deadline, {"row": 7, "column": 1, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_description_label, {"row": 8, "column": 0, "columnspan": 2, "sticky": "w"}),
+                (self.add_description, {"row": 9, "column": 0, "columnspan": 2, "sticky": "nsew", "pady": (0, 8)}),
+                (self.add_button_row, {"row": 10, "column": 0, "columnspan": 2, "sticky": "e"}),
+            ]
+            target_row = 9
+
+        for widget, opts in placements:
+            widget.grid(**opts)
+
+        container.rowconfigure(target_row, weight=1)
 
     def _build_bulk_tab(self):
         container = ctk.CTkFrame(self.bulk_tab)
         container.pack(fill="both", expand=True, padx=12, pady=12)
+        self.bulk_container = container
 
         self.bulk_instruction_text = (
-            "Use this structure when asking an AI assistant to prepare bulk tasks.\n"
-            "Each task should be on its own line using this template:\n"
+            "You are the TaskFocus bulk-import assistant.\n"
+            "1. Read the notes I provide and identify every actionable task.\n"
+            "2. Decide the best Type (Make/Ask/Arrange/Control), priority, start date, and deadline."
+            " Use context or today's date when a start is missing, and leave fields blank if truly unknown.\n"
+            "3. Capture who asked for the task and the assignee whenever the information exists.\n"
+            "4. Create a short, informative Title and keep supporting details inside Description.\n\n"
+            "Return the tasks exactly in this format, one per line:\n"
             "Type: Title — asked by <who asked> — assignee <assignee> — start <yyyy-mm-dd> — "
-            "deadline <yyyy-mm-dd> — priority <High|Medium|Low> — description <details>\n\n"
-            "Required field: Title. Optional fields may be omitted.\n"
-            "Dates accept yyyy-mm-dd or dd.mm.yyyy formats."
+            "deadline <yyyy-mm-dd> — priority <High|Medium|Low> — description <details>\n"
+            "Use yyyy-mm-dd dates (dd.mm.yyyy is also accepted on input). Title is required; omit an "
+            "optional segment entirely if the data is unavailable."
         )
 
         instruct_frame = ctk.CTkFrame(container)
@@ -1076,11 +1317,13 @@ class TaskFocusApp(ctk.CTk):
             text="Bulk import instructions for AI assistant",
             font=("Segoe UI", 14, "bold"),
         ).pack(anchor="w", padx=4, pady=(4, 2))
-        ctk.CTkLabel(
+        self.bulk_instruction_label = ctk.CTkLabel(
             instruct_frame,
             text=self.bulk_instruction_text,
             justify="left",
-        ).pack(anchor="w", padx=4, pady=(0, 6))
+            wraplength=760,
+        )
+        self.bulk_instruction_label.pack(anchor="w", padx=4, pady=(0, 6))
         ctk.CTkButton(
             instruct_frame,
             text="Copy instructions",
@@ -1088,11 +1331,18 @@ class TaskFocusApp(ctk.CTk):
             width=160,
         ).pack(anchor="w", padx=4)
 
-        form_help = (
-            "Paste one task per line in the editor below. Supported fields match the Add Task form:\n"
-            "Title, Type, Priority, Who asked, Assignee, Start Date, Deadline, Description."
+        self.bulk_form_help_text = (
+            "After the AI responds, paste the generated lines below. Each line can omit optional parts, "
+            "but the parser understands the same fields as the Add Task form: Title, Type, Priority, Who asked, "
+            "Assignee, Start Date, Deadline, and Description."
         )
-        ctk.CTkLabel(container, text=form_help, justify="left").pack(anchor="w", pady=(0, 8))
+        self.bulk_form_help_label = ctk.CTkLabel(
+            container,
+            text=self.bulk_form_help_text,
+            justify="left",
+            wraplength=760,
+        )
+        self.bulk_form_help_label.pack(anchor="w", pady=(0, 8))
 
         self.bulk_text = ctk.CTkTextbox(container, height=320)
         self.bulk_text.pack(fill="both", expand=True)
@@ -1102,6 +1352,60 @@ class TaskFocusApp(ctk.CTk):
         self.bulk_status = ctk.CTkLabel(btns, text="")
         self.bulk_status.pack(side="left")
         ctk.CTkButton(btns, text="Import", command=self._bulk_import).pack(side="right")
+
+    def _initialize_responsive_layout(self):
+        width = max(self.winfo_width(), 1)
+        self._update_responsive_layout(width)
+
+    def _on_window_configure(self, event):
+        if event.widget is not self:
+            return
+        self._pending_width = event.width
+        if self._responsive_after:
+            try:
+                self.after_cancel(self._responsive_after)
+            except Exception:
+                pass
+        self._responsive_after = self.after(120, self._commit_responsive_update)
+
+    def _commit_responsive_update(self):
+        self._responsive_after = None
+        width = self._pending_width or self.winfo_width()
+        self._update_responsive_layout(max(width, 1))
+
+    def _update_responsive_layout(self, width: int):
+        mode = "narrow" if width < 900 else "wide"
+        if mode != self._layout_mode:
+            self._layout_mode = mode
+            self._layout_add_form(mode)
+
+        self._apply_scaling(width)
+
+        wrap = max(width - 260, 360)
+        if hasattr(self, "bulk_instruction_label"):
+            self.bulk_instruction_label.configure(wraplength=wrap)
+        if hasattr(self, "bulk_form_help_label"):
+            self.bulk_form_help_label.configure(wraplength=wrap)
+
+    def _apply_scaling(self, width: int):
+        if width >= 1200:
+            scale = 1.0
+        elif width >= 1000:
+            scale = 0.95
+        elif width >= 820:
+            scale = 0.9
+        else:
+            scale = 0.85
+
+        if self._widget_scale == scale:
+            return
+        self._widget_scale = scale
+        ctk.set_widget_scaling(scale)
+        try:
+            ctk.set_window_scaling(scale)
+        except AttributeError:
+            # Older CustomTkinter versions do not expose set_window_scaling
+            pass
 
     # ----------------------- Actions -----------------------
     def refresh_all(self):
@@ -1326,6 +1630,14 @@ class TaskFocusApp(ctk.CTk):
             "focus": False,
             "description": description,
         }
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
 
     def _copy_bulk_instructions(self):
         try:
