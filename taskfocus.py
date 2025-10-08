@@ -56,6 +56,17 @@ except ImportError:
     plt = None
     FigureCanvasTkAgg = None
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
 # -------------------------------
 # CONFIG
 # -------------------------------
@@ -521,6 +532,38 @@ class TaskStore:
                 }
                 t["sessions"].append(session_entry)
                 t["time_spent_minutes"] = int(t.get("time_spent_minutes", 0)) + int(minutes)
+                self.save()
+                return session_entry
+        return None
+
+    def register_people(self, *names: str | None):
+        names_clean = [n.strip() for n in names if n and n.strip()]
+        if not names_clean:
+            return
+        current = set(self.data.get("meta", {}).get("people", []))
+        updated = False
+        for name in names_clean:
+            if name not in current:
+                current.add(name)
+                updated = True
+        if updated:
+            self.data["meta"]["people"] = sorted(current)
+
+    def get_people(self) -> list[str]:
+        return list(self.data.get("meta", {}).get("people", []))
+
+    def append_session(self, task_id: int, minutes: int, note: str):
+        for t in self.data.get("tasks", []):
+            if t.get("id") == task_id:
+                self._ensure_task_defaults(t)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                session_entry = {
+                    "timestamp": timestamp,
+                    "minutes": minutes,
+                    "note": note,
+                }
+                t["sessions"].append(session_entry)
+                t["time_spent_minutes"] = int(t.get("time_spent_minutes", 0)) + int(minutes)
                 addition = f"[{timestamp}] ({minutes} min)"
                 if note:
                     addition += f" {note}"
@@ -872,7 +915,7 @@ class TaskCard(ctk.CTkFrame):
 
         # Left labels container
         self.left_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.left_frame.grid(row=0, column=0, sticky="ew", padx=(12, 6), pady=12)
+        self.left_frame.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=12)
 
         title_row = ctk.CTkFrame(self.left_frame, fg_color="transparent")
         title_row.pack(anchor="w", fill="x")
@@ -984,15 +1027,16 @@ class TaskCard(ctk.CTkFrame):
                 btn.pack(fill="x", pady=2)
 
         # Right buttons
-        self.btns_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.btns_frame.grid(row=0, column=1, sticky="e", padx=(6, 12), pady=12)
+        self.btns_frame = ctk.CTkFrame(self, fg_color="transparent", width=200)
+        self.btns_frame.grid(row=0, column=1, sticky="ne", padx=(6, 12), pady=12)
+        self.btns_frame.grid_propagate(False)
 
         focus_active = bool(task.get("focus"))
         focus_icon = "★" if focus_active else "☆"
         self.focus_btn = self._make_button(
             focus_icon,
             lambda: self.on_focus_toggle(task),
-            width=48,
+            width=44,
         )
         if focus_active:
             self.focus_btn.configure(
@@ -1010,17 +1054,17 @@ class TaskCard(ctk.CTkFrame):
         self.timer_btn = self._make_button(
             "Start work",
             lambda: self.on_start_timer(task),
-            width=114,
+            width=96,
         )
         self.log_btn = self._make_button(
             "Log time",
             lambda: self.on_log_time(task),
-            width=102,
+            width=88,
         )
         self.edit_btn = self._make_button(
             "Edit",
             lambda: self.on_edit(task),
-            width=76,
+            width=68,
             fg_color="#374151",
             hover_color="#4B5563",
         )
@@ -1032,7 +1076,7 @@ class TaskCard(ctk.CTkFrame):
         self.done_btn = self._make_button(
             done_text,
             lambda: self.on_done_toggle(task),
-            width=92,
+            width=84,
             fg_color=done_fg,
             hover_color=done_hover,
         )
@@ -1050,6 +1094,7 @@ class TaskCard(ctk.CTkFrame):
         self._arrange_buttons("inline")
 
         self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=0)
         self.grid_rowconfigure(0, weight=1)
 
         self.bind("<Configure>", self._on_configure)
@@ -1059,9 +1104,10 @@ class TaskCard(ctk.CTkFrame):
 
     def _estimate_text_height(self, text: str) -> int:
         lines = text.count("\n") + 1
-        extra = max(len(text) // 120, 0)
-        total_lines = lines + extra
-        return max(80, min(240, total_lines * 22))
+        approx = max((len(text) + 79) // 80, 1)
+        total_lines = max(lines, approx)
+        total_lines = max(1, min(3, total_lines))
+        return max(40, total_lines * 24)
 
     def _make_button(
         self,
@@ -1078,11 +1124,11 @@ class TaskCard(ctk.CTkFrame):
             text=text,
             command=command,
             width=width,
-            height=34,
+            height=32,
             fg_color=fg_color,
             hover_color=hover_color,
             text_color=text_color,
-            font=("Segoe UI", 13),
+            font=("Segoe UI", 12),
             corner_radius=6,
         )
 
@@ -1094,12 +1140,12 @@ class TaskCard(ctk.CTkFrame):
                 btn.pack(fill="x", padx=4, pady=4)
         else:
             for btn in self._buttons:
-                btn.pack(side="left", padx=4)
+                btn.pack(side="left", padx=3)
         self._layout_mode = mode
 
     def _on_configure(self, _event=None):
         width = max(self.winfo_width(), 1)
-        wrap = max(width - 220, 260)
+        wrap = max(width - 180, 260)
         self.title_label.configure(wraplength=wrap)
         self.meta_line.configure(wraplength=wrap)
 
@@ -1246,6 +1292,212 @@ class TaskEditor(ctk.CTkToplevel):
             return
         self.on_save(updated)
         self.destroy()
+
+    def _people_values(self) -> list[str]:
+        return [""] + self.people
+
+    def _format_sessions(self, task: dict) -> str:
+        sessions = task.get("sessions") or []
+        if not sessions:
+            return "No sessions recorded yet."
+        lines = []
+        for session in sessions:
+            ts = session.get("timestamp", "?")
+            minutes = session.get("minutes", 0)
+            note = session.get("note", "")
+            line = f"{ts} — {minutes} min"
+            if note:
+                line += f": {note}"
+            lines.append(line)
+        return "\n".join(lines)
+
+
+class SessionLogDialog(ctk.CTkToplevel):
+    def __init__(
+        self,
+        master,
+        *,
+        title: str,
+        preset_minutes: int | None = None,
+        allow_minutes_edit: bool = True,
+        prompt: str,
+    ):
+        super().__init__(master)
+        self.title(title)
+        self.geometry("540x440")
+        self.minsize(480, 360)
+        self.transient(master)
+        self.grab_set()
+        self.result: tuple[int, str] | None = None
+
+        container = ctk.CTkFrame(self)
+        container.pack(fill="both", expand=True, padx=18, pady=18)
+
+        time_label = ctk.CTkLabel(container, text="Minutes spent", font=("Segoe UI", 14, "bold"))
+        time_label.pack(anchor="w")
+
+        self.minutes_var = tk.StringVar()
+        if preset_minutes is not None:
+            self.minutes_var.set(str(preset_minutes))
+        self.error_label = ctk.CTkLabel(container, text="", text_color="#F87171")
+        self.minutes_entry = ctk.CTkEntry(container, textvariable=self.minutes_var, font=("Segoe UI", 14))
+        self.minutes_entry.pack(fill="x", pady=(4, 12))
+        if not allow_minutes_edit and preset_minutes is not None:
+            self.minutes_entry.configure(state="disabled")
+        else:
+            self.minutes_var.trace_add("write", lambda *_: self.error_label.configure(text=""))
+
+        ctk.CTkLabel(
+            container,
+            text=prompt,
+            justify="left",
+            anchor="w",
+        ).pack(anchor="w")
+
+        self.note_box = ctk.CTkTextbox(container, height=220)
+        self.note_box.configure(font=("Segoe UI", 13), wrap="word")
+        self.note_box.pack(fill="both", expand=True, pady=(8, 12))
+
+        self.error_label.pack(anchor="w", pady=(0, 8))
+
+        btns = ctk.CTkFrame(container, fg_color="transparent")
+        btns.pack(fill="x")
+        ctk.CTkButton(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
+        ctk.CTkButton(btns, text="Save", command=self._submit).pack(side="right", padx=6)
+
+        if allow_minutes_edit and preset_minutes is None:
+            self.minutes_entry.focus_set()
+        else:
+            self.note_box.focus_set()
+
+        self.bind("<Return>", self._submit_event)
+        self.bind("<Escape>", self._cancel_event)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def show(self) -> tuple[int, str] | None:
+        self.wait_window()
+        return self.result
+
+    def _submit_event(self, _event=None):
+        self._submit()
+
+    def _cancel_event(self, _event=None):
+        self._cancel()
+
+    def _submit(self):
+        try:
+            minutes = parse_minutes_input(self.minutes_var.get())
+        except ValueError as exc:
+            self.error_label.configure(text=str(exc))
+            return
+        note = self.note_box.get("1.0", tk.END).strip()
+        self.result = (minutes, note)
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class PomodoroWindow(ctk.CTkToplevel):
+    def __init__(self, master, task: dict, on_complete, on_close):
+        super().__init__(master)
+        self.title(f"Timer — {task.get('title', 'Task')}")
+        self.geometry("360x260")
+        self.resizable(False, False)
+        self.on_complete = on_complete
+        self.on_close = on_close
+        self._after_id = None
+        self._timer_running = False
+        self._total_minutes = 0
+        self._remaining_seconds = 0
+
+        self.label = ctk.CTkLabel(self, text=f"Task: {task.get('title', '(no title)')}", wraplength=320)
+        self.label.pack(pady=(16, 8), padx=16)
+
+        entry_frame = ctk.CTkFrame(self, fg_color="transparent")
+        entry_frame.pack(pady=(0, 12))
+        ctk.CTkLabel(entry_frame, text="Minutes to focus:").pack(side="left", padx=(0, 8))
+        self.minutes_var = tk.StringVar(value="25")
+        self.minutes_entry = ctk.CTkEntry(entry_frame, textvariable=self.minutes_var, width=80)
+        self.minutes_entry.pack(side="left")
+
+        self.timer_label = ctk.CTkLabel(self, text="00:00", font=("Segoe UI", 28, "bold"))
+        self.timer_label.pack(pady=(0, 12))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=(0, 16))
+        self.start_btn = ctk.CTkButton(btn_frame, text="Start", command=self._start_timer)
+        self.start_btn.pack(side="left", padx=6)
+        self.stop_btn = ctk.CTkButton(btn_frame, text="Stop", command=self._stop_timer, state="disabled")
+        self.stop_btn.pack(side="left", padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
+
+    def _start_timer(self):
+        if self._timer_running:
+            return
+        try:
+            minutes = int(self.minutes_var.get())
+        except (TypeError, ValueError):
+            messagebox.showwarning("Timer", "Please enter a valid number of minutes.")
+            return
+        if minutes <= 0:
+            messagebox.showwarning("Timer", "Minutes must be greater than zero.")
+            return
+        self._total_minutes = minutes
+        self._remaining_seconds = minutes * 60
+        self._timer_running = True
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.minutes_entry.configure(state="disabled")
+        self._tick()
+
+    def _tick(self):
+        mins, secs = divmod(self._remaining_seconds, 60)
+        self.timer_label.configure(text=f"{mins:02d}:{secs:02d}")
+        if self._remaining_seconds <= 0:
+            self._finish_timer()
+            return
+        self._remaining_seconds -= 1
+        self._after_id = self.after(1000, self._tick)
+
+    def _finish_timer(self):
+        self._timer_running = False
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.minutes_entry.configure(state="normal")
+        if self.on_complete:
+            self.on_complete(self._total_minutes)
+        self._cleanup_and_close()
+
+    def _stop_timer(self):
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self._timer_running = False
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.minutes_entry.configure(state="normal")
+        self._cleanup_and_close()
+
+    def _on_close_request(self):
+        if self._timer_running and not messagebox.askyesno("Stop timer?", "Timer is still running. Stop it?"):
+            return
+        self._stop_timer()
+
+    def _cleanup_and_close(self):
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self._timer_running = False
+        if self.on_close:
+            self.on_close()
+        if self.winfo_exists():
+            super().destroy()
 
     def _people_values(self) -> list[str]:
         return [""] + self.people
@@ -2337,6 +2589,21 @@ class TaskFocusApp(ctk.CTk):
         top.pack(fill="x", pady=(8,8))
         ctk.CTkLabel(top, text="Tasks that can be started today (open status)").pack(side="left", padx=6)
         ctk.CTkButton(top, text="Refresh", command=self.refresh_all).pack(side="right", padx=6)
+        self.today_search_var = tk.StringVar()
+        self.today_search_var.trace_add("write", lambda *_: self._refresh_today_list())
+        ctk.CTkButton(
+            top,
+            text="Clear",
+            width=64,
+            command=lambda: self._clear_search(self.today_search_var),
+        ).pack(side="right", padx=(6, 0))
+        self.today_search_entry = ctk.CTkEntry(
+            top,
+            placeholder_text="Search…",
+            width=220,
+            textvariable=self.today_search_var,
+        )
+        self.today_search_entry.pack(side="right", padx=(6, 0))
 
         # Scrollable list
         self.today_list = ctk.CTkScrollableFrame(self.today_tab)
@@ -2352,6 +2619,21 @@ class TaskFocusApp(ctk.CTk):
         self.status_filter.set("all")
 
         ctk.CTkButton(bar, text="Refresh", command=self._refresh_all_list).pack(side="right", padx=6)
+        self.all_search_var = tk.StringVar()
+        self.all_search_var.trace_add("write", lambda *_: self._refresh_all_list())
+        ctk.CTkButton(
+            bar,
+            text="Clear",
+            width=64,
+            command=lambda: self._clear_search(self.all_search_var),
+        ).pack(side="right", padx=(6, 0))
+        self.all_search_entry = ctk.CTkEntry(
+            bar,
+            placeholder_text="Search…",
+            width=220,
+            textvariable=self.all_search_var,
+        )
+        self.all_search_entry.pack(side="right", padx=(6, 0))
 
         # List
         self.all_list = ctk.CTkScrollableFrame(self.all_tab)
@@ -2381,8 +2663,9 @@ class TaskFocusApp(ctk.CTk):
             text="Time spent per task (last 7 days)",
             font=("Segoe UI", 16, "bold"),
         ).pack(anchor="w", padx=8, pady=(8, 4))
-        self.time_chart_holder = ctk.CTkFrame(self.time_section, fg_color="#111827")
+        self.time_chart_holder = ctk.CTkFrame(self.time_section, fg_color="#111827", height=360)
         self.time_chart_holder.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.time_chart_holder.pack_propagate(False)
         self.time_canvas: FigureCanvasTkAgg | None = None
 
         # Burn-down chart section
@@ -2393,9 +2676,23 @@ class TaskFocusApp(ctk.CTk):
             text="Task burn-down (last 7 days)",
             font=("Segoe UI", 16, "bold"),
         ).pack(anchor="w", padx=8, pady=(8, 4))
-        self.burn_chart_holder = ctk.CTkFrame(self.burn_section, fg_color="#111827")
+        self.burn_chart_holder = ctk.CTkFrame(self.burn_section, fg_color="#111827", height=320)
         self.burn_chart_holder.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.burn_chart_holder.pack_propagate(False)
         self.burn_canvas: FigureCanvasTkAgg | None = None
+
+        # Workload by assignee chart section
+        self.workload_section = ctk.CTkFrame(self.stats_container)
+        self.workload_section.pack(fill="both", expand=True, pady=(0, 16))
+        ctk.CTkLabel(
+            self.workload_section,
+            text="Open tasks by assignee and priority",
+            font=("Segoe UI", 16, "bold"),
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+        self.workload_chart_holder = ctk.CTkFrame(self.workload_section, fg_color="#111827", height=320)
+        self.workload_chart_holder.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.workload_chart_holder.pack_propagate(False)
+        self.workload_canvas: FigureCanvasTkAgg | None = None
 
     def _build_add_tab(self):
         container = ctk.CTkFrame(self.add_tab)
@@ -2587,6 +2884,7 @@ class TaskFocusApp(ctk.CTk):
             return
         self._render_time_spent_chart()
         self._render_burn_chart()
+        self._render_workload_chart()
 
     def _render_time_spent_chart(self):
         if not MATPLOTLIB_AVAILABLE or not getattr(self, "time_chart_holder", None):
@@ -2651,7 +2949,7 @@ class TaskFocusApp(ctk.CTk):
         )
         color_cycle = itertools.cycle(base_colors)
 
-        fig, ax = plt.subplots(figsize=(8, 4), dpi=100)
+        fig, ax = plt.subplots(figsize=(11, 5), dpi=110)
         for title in top_titles:
             day_map = per_task.get(title, {})
             values = [day_map.get(day, 0) / 60 for day in day_range]
@@ -2680,7 +2978,7 @@ class TaskFocusApp(ctk.CTk):
         self.time_canvas = FigureCanvasTkAgg(fig, master=self.time_chart_holder)
         self.time_canvas.draw()
         widget = self.time_canvas.get_tk_widget()
-        widget.pack(fill="both", expand=True)
+        widget.pack(fill="both", expand=True, padx=4, pady=4)
         widget.configure(background="#111827", highlightthickness=0, borderwidth=0)
         self._time_fig = fig
 
@@ -2727,7 +3025,7 @@ class TaskFocusApp(ctk.CTk):
             remaining_counts.append(max(created_total - completed_total, 0))
             completed_counts.append(completed_total)
 
-        fig, ax = plt.subplots(figsize=(8, 4), dpi=100)
+        fig, ax = plt.subplots(figsize=(11, 4.5), dpi=110)
         x = list(range(len(day_range)))
         ax.plot(x, remaining_counts, marker="o", color="#38BDF8", label="Remaining tasks")
         ax.plot(x, completed_counts, marker="o", color="#22C55E", label="Completed tasks")
@@ -2754,9 +3052,85 @@ class TaskFocusApp(ctk.CTk):
         self.burn_canvas = FigureCanvasTkAgg(fig, master=self.burn_chart_holder)
         self.burn_canvas.draw()
         widget = self.burn_canvas.get_tk_widget()
-        widget.pack(fill="both", expand=True)
+        widget.pack(fill="both", expand=True, padx=4, pady=4)
         widget.configure(background="#111827", highlightthickness=0, borderwidth=0)
         self._burn_fig = fig
+
+    def _render_workload_chart(self):
+        if not MATPLOTLIB_AVAILABLE or not getattr(self, "workload_chart_holder", None):
+            return
+        if self.workload_canvas:
+            widget = self.workload_canvas.get_tk_widget()
+            widget.destroy()
+            self.workload_canvas = None
+        for child in list(self.workload_chart_holder.winfo_children()):
+            child.destroy()
+
+        tasks = [t for t in self.store.data.get("tasks", []) if t.get("status") != "done"]
+        if not tasks:
+            ctk.CTkLabel(
+                self.workload_chart_holder,
+                text="No open tasks to analyse.",
+                text_color="#9CA3AF",
+            ).pack(pady=24)
+            return
+
+        per_person: dict[str, dict[str, int]] = {}
+        for task in tasks:
+            assignee = task.get("assignee") or "Unassigned"
+            pr = task.get("priority") or "Medium"
+            bucket = per_person.setdefault(assignee, {p: 0 for p in PRIORITIES})
+            if pr not in bucket:
+                bucket[pr] = 0
+            bucket[pr] += 1
+
+        totals = {name: sum(pr_counts.values()) for name, pr_counts in per_person.items()}
+        sorted_people = sorted(totals.items(), key=lambda item: item[1], reverse=True)
+        top_people = [name for name, _ in sorted_people[:6]]
+        if len(sorted_people) > 6:
+            other_bucket = {p: 0 for p in PRIORITIES}
+            for name, _ in sorted_people[6:]:
+                counts = per_person.get(name, {})
+                for pr in PRIORITIES:
+                    other_bucket[pr] += counts.get(pr, 0)
+            if sum(other_bucket.values()):
+                per_person["Other"] = other_bucket
+                top_people.append("Other")
+
+        x = list(range(len(top_people)))
+        bottoms = [0] * len(top_people)
+        color_map = {"High": "#F97316", "Medium": "#8B5CF6", "Low": "#22D3EE"}
+
+        fig, ax = plt.subplots(figsize=(11, 4.2), dpi=110)
+        for priority in PRIORITIES:
+            values = [per_person.get(name, {}).get(priority, 0) for name in top_people]
+            ax.bar(x, values, bottom=bottoms, label=priority, color=color_map.get(priority, "#8B5CF6"), edgecolor="#0F172A", linewidth=0.3)
+            bottoms = [bottoms[i] + values[i] for i in range(len(bottoms))]
+
+        ax.set_ylabel("Open tasks", color="#E5E7EB")
+        ax.set_xticks(x)
+        ax.set_xticklabels(top_people, rotation=20, ha="right", color="#E5E7EB")
+        ax.tick_params(axis="y", colors="#E5E7EB")
+        ax.grid(axis="y", color="#374151", linestyle="--", alpha=0.4)
+        ax.set_ylim(bottom=0)
+        for spine in ax.spines.values():
+            spine.set_color("#374151")
+        ax.set_facecolor("#111827")
+        fig.patch.set_facecolor("#111827")
+        legend = ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), frameon=True)
+        if legend:
+            legend.get_frame().set_facecolor("#1F2937")
+            legend.get_frame().set_edgecolor("#4B5563")
+            for text in legend.get_texts():
+                text.set_color("#F9FAFB")
+        fig.tight_layout()
+
+        self.workload_canvas = FigureCanvasTkAgg(fig, master=self.workload_chart_holder)
+        self.workload_canvas.draw()
+        widget = self.workload_canvas.get_tk_widget()
+        widget.pack(fill="both", expand=True, padx=4, pady=4)
+        widget.configure(background="#111827", highlightthickness=0, borderwidth=0)
+        self._workload_fig = fig
 
     def _initialize_responsive_layout(self):
         width = max(self.winfo_width(), 1)
@@ -2816,11 +3190,41 @@ class TaskFocusApp(ctk.CTk):
         self.status_label.configure(text=f"Tasks: {len(self.store.data['tasks'])}")
         self._refresh_stats()
 
+    def _clear_search(self, var: tk.StringVar):
+        if var.get():
+            var.set("")
+
+    def _task_matches_query(self, task: dict, query: str) -> bool:
+        if not query:
+            return True
+        haystacks = [
+            task.get("title", ""),
+            task.get("description", ""),
+            task.get("who_asked", ""),
+            task.get("assignee", ""),
+            task.get("type", ""),
+        ]
+        for session in task.get("sessions", []) or []:
+            haystacks.append(session.get("note", ""))
+        combined = " ".join(text for text in haystacks if text).lower()
+        query = query.lower()
+        if query in combined:
+            return True
+        tokens = [token for token in query.split() if token]
+        if not tokens:
+            return False
+        return all(token in combined for token in tokens)
+
     def _refresh_today_list(self):
         for w in self.today_list.winfo_children():
             w.destroy()
         tasks = self.store.eligible_today()
         tasks.sort(key=sort_key)
+        query = getattr(self, "today_search_var", None)
+        if query:
+            needle = query.get().strip().lower()
+            if needle:
+                tasks = [t for t in tasks if self._task_matches_query(t, needle)]
         # Show focused first
         focused = [t for t in tasks if t.get("focus")]
         others = [t for t in tasks if not t.get("focus")]
@@ -2846,6 +3250,11 @@ class TaskFocusApp(ctk.CTk):
         else:
             tasks = self.store.list_tasks(status)
         tasks.sort(key=sort_key)
+        query = getattr(self, "all_search_var", None)
+        if query:
+            needle = query.get().strip().lower()
+            if needle:
+                tasks = [t for t in tasks if self._task_matches_query(t, needle)]
         for t in tasks:
             self._add_task_card(self.all_list, t)
         if not tasks:
@@ -3064,6 +3473,14 @@ class TaskFocusApp(ctk.CTk):
             "focus": False,
             "description": description,
         }
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
 
     def _copy_bulk_instructions(self):
         try:
