@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import re
+import math
 from datetime import datetime, date, timedelta
 
 import webbrowser
@@ -44,6 +45,17 @@ try:
 except ImportError:
     print("Please install tkcalendar: pip install tkcalendar")
     raise
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
 
 try:
     import matplotlib
@@ -564,6 +576,38 @@ class TaskStore:
                 }
                 t["sessions"].append(session_entry)
                 t["time_spent_minutes"] = int(t.get("time_spent_minutes", 0)) + int(minutes)
+                self.save()
+                return session_entry
+        return None
+
+    def register_people(self, *names: str | None):
+        names_clean = [n.strip() for n in names if n and n.strip()]
+        if not names_clean:
+            return
+        current = set(self.data.get("meta", {}).get("people", []))
+        updated = False
+        for name in names_clean:
+            if name not in current:
+                current.add(name)
+                updated = True
+        if updated:
+            self.data["meta"]["people"] = sorted(current)
+
+    def get_people(self) -> list[str]:
+        return list(self.data.get("meta", {}).get("people", []))
+
+    def append_session(self, task_id: int, minutes: int, note: str):
+        for t in self.data.get("tasks", []):
+            if t.get("id") == task_id:
+                self._ensure_task_defaults(t)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                session_entry = {
+                    "timestamp": timestamp,
+                    "minutes": minutes,
+                    "note": note,
+                }
+                t["sessions"].append(session_entry)
+                t["time_spent_minutes"] = int(t.get("time_spent_minutes", 0)) + int(minutes)
                 addition = f"[{timestamp}] ({minutes} min)"
                 if note:
                     addition += f" {note}"
@@ -903,6 +947,7 @@ class TaskCard(ctk.CTkFrame):
         on_focus_toggle,
         on_start_timer,
         on_log_time,
+        on_postpone,
     ):
         super().__init__(master)
         self.task = task
@@ -911,6 +956,7 @@ class TaskCard(ctk.CTkFrame):
         self.on_focus_toggle = on_focus_toggle
         self.on_start_timer = on_start_timer
         self.on_log_time = on_log_time
+        self.on_postpone = on_postpone
         self._layout_mode: str | None = None
 
         # Left labels container
@@ -1027,7 +1073,7 @@ class TaskCard(ctk.CTkFrame):
                 btn.pack(fill="x", pady=2)
 
         # Right buttons
-        self.btns_frame = ctk.CTkFrame(self, fg_color="transparent", width=200)
+        self.btns_frame = ctk.CTkFrame(self, fg_color="transparent", width=220)
         self.btns_frame.grid(row=0, column=1, sticky="ne", padx=(6, 12), pady=12)
         self.btns_frame.grid_propagate(False)
 
@@ -1054,12 +1100,19 @@ class TaskCard(ctk.CTkFrame):
         self.timer_btn = self._make_button(
             "Start work",
             lambda: self.on_start_timer(task),
-            width=96,
+            width=92,
         )
         self.log_btn = self._make_button(
             "Log time",
             lambda: self.on_log_time(task),
-            width=88,
+            width=84,
+        )
+        self.postpone_btn = self._make_button(
+            "Postpone",
+            lambda: self.on_postpone(task),
+            width=92,
+            fg_color="#1F2937",
+            hover_color="#374151",
         )
         self.edit_btn = self._make_button(
             "Edit",
@@ -1088,6 +1141,7 @@ class TaskCard(ctk.CTkFrame):
             self.focus_btn,
             self.timer_btn,
             self.log_btn,
+            self.postpone_btn,
             self.edit_btn,
             self.done_btn,
         ]
@@ -1292,6 +1346,312 @@ class TaskEditor(ctk.CTkToplevel):
             return
         self.on_save(updated)
         self.destroy()
+
+    def _people_values(self) -> list[str]:
+        return [""] + self.people
+
+    def _format_sessions(self, task: dict) -> str:
+        sessions = task.get("sessions") or []
+        if not sessions:
+            return "No sessions recorded yet."
+        lines = []
+        for session in sessions:
+            ts = session.get("timestamp", "?")
+            minutes = session.get("minutes", 0)
+            note = session.get("note", "")
+            line = f"{ts} — {minutes} min"
+            if note:
+                line += f": {note}"
+            lines.append(line)
+        return "\n".join(lines)
+
+
+class SessionLogDialog(ctk.CTkToplevel):
+    def __init__(
+        self,
+        master,
+        *,
+        title: str,
+        preset_minutes: int | None = None,
+        allow_minutes_edit: bool = True,
+        prompt: str,
+    ):
+        super().__init__(master)
+        self.title(title)
+        self.geometry("540x440")
+        self.minsize(480, 360)
+        self.transient(master)
+        self.grab_set()
+        self.result: tuple[int, str] | None = None
+
+        container = ctk.CTkFrame(self)
+        container.pack(fill="both", expand=True, padx=18, pady=18)
+
+        time_label = ctk.CTkLabel(container, text="Minutes spent", font=("Segoe UI", 14, "bold"))
+        time_label.pack(anchor="w")
+
+        self.minutes_var = tk.StringVar()
+        if preset_minutes is not None:
+            self.minutes_var.set(str(preset_minutes))
+        self.error_label = ctk.CTkLabel(container, text="", text_color="#F87171")
+        self.minutes_entry = ctk.CTkEntry(container, textvariable=self.minutes_var, font=("Segoe UI", 14))
+        self.minutes_entry.pack(fill="x", pady=(4, 12))
+        if not allow_minutes_edit and preset_minutes is not None:
+            self.minutes_entry.configure(state="disabled")
+        else:
+            self.minutes_var.trace_add("write", lambda *_: self.error_label.configure(text=""))
+
+        ctk.CTkLabel(
+            container,
+            text=prompt,
+            justify="left",
+            anchor="w",
+        ).pack(anchor="w")
+
+        self.note_box = ctk.CTkTextbox(container, height=220)
+        self.note_box.configure(font=("Segoe UI", 13), wrap="word")
+        self.note_box.pack(fill="both", expand=True, pady=(8, 12))
+
+        self.error_label.pack(anchor="w", pady=(0, 8))
+
+        btns = ctk.CTkFrame(container, fg_color="transparent")
+        btns.pack(fill="x")
+        ctk.CTkButton(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
+        ctk.CTkButton(btns, text="Save", command=self._submit).pack(side="right", padx=6)
+
+        if allow_minutes_edit and preset_minutes is None:
+            self.minutes_entry.focus_set()
+        else:
+            self.note_box.focus_set()
+
+        self.bind("<Return>", self._submit_event)
+        self.bind("<Escape>", self._cancel_event)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def show(self) -> tuple[int, str] | None:
+        self.wait_window()
+        return self.result
+
+    def _submit_event(self, _event=None):
+        self._submit()
+
+    def _cancel_event(self, _event=None):
+        self._cancel()
+
+    def _submit(self):
+        try:
+            minutes = parse_minutes_input(self.minutes_var.get())
+        except ValueError as exc:
+            self.error_label.configure(text=str(exc))
+            return
+        note = self.note_box.get("1.0", tk.END).strip()
+        self.result = (minutes, note)
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class PostponeDialog(ctk.CTkToplevel):
+    def __init__(self, master, task: dict):
+        super().__init__(master)
+        self.title("Postpone task")
+        self.geometry("380x260")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self.result: int | None = None
+
+        title = task.get("title", "Task")
+        ctk.CTkLabel(
+            self,
+            text=f"How many days would you like to postpone '{title}'?",
+            wraplength=340,
+            justify="left",
+        ).pack(padx=20, pady=(20, 12))
+
+        quick = ctk.CTkFrame(self, fg_color="transparent")
+        quick.pack(pady=(0, 12))
+
+        for days in (1, 2, 3):
+            ctk.CTkButton(
+                quick,
+                text=f"+{days} day" + ("s" if days > 1 else ""),
+                command=lambda d=days: self._select(d),
+                width=90,
+            ).pack(side="left", padx=6)
+
+        custom_frame = ctk.CTkFrame(self, fg_color="transparent")
+        custom_frame.pack(fill="x", padx=20)
+        ctk.CTkLabel(custom_frame, text="Custom days:").pack(anchor="w")
+        self.custom_var = tk.StringVar()
+        self.custom_entry = ctk.CTkEntry(custom_frame, textvariable=self.custom_var)
+        self.custom_entry.pack(fill="x", pady=(4, 8))
+        self.custom_entry.focus_set()
+
+        self.error_label = ctk.CTkLabel(self, text="", text_color="#F87171")
+        self.error_label.pack()
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.pack(pady=(12, 16))
+        ctk.CTkButton(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
+        ctk.CTkButton(btns, text="Apply", command=self._apply_custom).pack(side="right", padx=6)
+
+        self.bind("<Return>", self._apply_custom_event)
+        self.bind("<Escape>", self._cancel_event)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _select(self, days: int):
+        self.result = days
+        self.destroy()
+
+    def _apply_custom_event(self, _event=None):
+        self._apply_custom()
+
+    def _cancel_event(self, _event=None):
+        self._cancel()
+
+    def _apply_custom(self):
+        value = (self.custom_var.get() or "").strip()
+        if not value:
+            self.error_label.configure(text="Please enter the number of days to postpone.")
+            return
+        try:
+            days = int(value)
+        except ValueError:
+            self.error_label.configure(text="Enter a whole number of days.")
+            return
+        if days <= 0:
+            self.error_label.configure(text="Days must be greater than zero.")
+            return
+        self.result = days
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+    def show(self) -> int | None:
+        self.wait_window()
+        return self.result
+
+
+class PomodoroWindow(ctk.CTkToplevel):
+    def __init__(self, master, task: dict, on_complete, on_close):
+        super().__init__(master)
+        self.title(f"Timer — {task.get('title', 'Task')}")
+        self.geometry("380x280")
+        self.resizable(False, False)
+        self.on_complete = on_complete
+        self.on_close = on_close
+        self._after_id: str | None = None
+        self._timer_running = False
+        self._total_minutes = 0
+        self._remaining_seconds = 0
+        self._elapsed_seconds = 0
+
+        self.label = ctk.CTkLabel(self, text=f"Task: {task.get('title', '(no title)')}", wraplength=340)
+        self.label.pack(pady=(16, 8), padx=16)
+
+        entry_frame = ctk.CTkFrame(self, fg_color="transparent")
+        entry_frame.pack(pady=(0, 12))
+        ctk.CTkLabel(entry_frame, text="Minutes to focus:").pack(side="left", padx=(0, 8))
+        self.minutes_var = tk.StringVar(value="25")
+        self.minutes_entry = ctk.CTkEntry(entry_frame, textvariable=self.minutes_var, width=90)
+        self.minutes_entry.pack(side="left")
+
+        self.timer_label = ctk.CTkLabel(self, text="00:00", font=("Segoe UI", 28, "bold"))
+        self.timer_label.pack(pady=(0, 12))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=(0, 16))
+        self.start_btn = ctk.CTkButton(btn_frame, text="Start", command=self._start_timer)
+        self.start_btn.pack(side="left", padx=6)
+        self.stop_btn = ctk.CTkButton(btn_frame, text="Stop", command=self._stop_timer, state="disabled")
+        self.stop_btn.pack(side="left", padx=6)
+        self.cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=self._cancel_timer)
+        self.cancel_btn.pack(side="left", padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
+
+    def _start_timer(self):
+        if self._timer_running:
+            return
+        try:
+            minutes = int(self.minutes_var.get())
+        except (TypeError, ValueError):
+            messagebox.showwarning("Timer", "Please enter a valid number of minutes.")
+            return
+        if minutes <= 0:
+            messagebox.showwarning("Timer", "Minutes must be greater than zero.")
+            return
+        self._total_minutes = minutes
+        self._remaining_seconds = minutes * 60
+        self._elapsed_seconds = 0
+        self._timer_running = True
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.minutes_entry.configure(state="disabled")
+        self._tick()
+
+    def _tick(self):
+        mins, secs = divmod(self._remaining_seconds, 60)
+        self.timer_label.configure(text=f"{mins:02d}:{secs:02d}")
+        if self._remaining_seconds <= 0:
+            self._elapsed_seconds = self._total_minutes * 60
+            self._complete_session(ended_early=False)
+            return
+        self._remaining_seconds -= 1
+        self._elapsed_seconds += 1
+        self._after_id = self.after(1000, self._tick)
+
+    def _stop_timer(self):
+        if not self._timer_running:
+            return
+        if self._elapsed_seconds <= 0:
+            # Nothing tracked yet, treat as cancel.
+            self._cancel_timer()
+            return
+        minutes = max(1, math.ceil(self._elapsed_seconds / 60))
+        self._complete_session(ended_early=True, minutes_override=minutes)
+
+    def _cancel_timer(self, confirm: bool = True):
+        if self._timer_running and confirm:
+            if not messagebox.askyesno("Cancel session?", "Discard this timer session without logging time?"):
+                return
+        self._halt_timer()
+        self._close_window()
+
+    def _complete_session(self, *, ended_early: bool, minutes_override: int | None = None):
+        minutes = minutes_override if minutes_override is not None else self._total_minutes
+        self._halt_timer()
+        if self.on_complete:
+            self.on_complete(minutes, ended_early)
+        self._close_window()
+
+    def _halt_timer(self):
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self._timer_running = False
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.minutes_entry.configure(state="normal")
+
+    def _on_close_request(self):
+        if self._timer_running:
+            if not messagebox.askyesno("Cancel session?", "Timer is running. Cancel without saving?"):
+                return
+            self._cancel_timer(confirm=False)
+            return
+        self._cancel_timer(confirm=False)
+
+    def _close_window(self):
+        if self.on_close:
+            self.on_close()
+        if self.winfo_exists():
+            super().destroy()
 
     def _people_values(self) -> list[str]:
         return [""] + self.people
@@ -3266,7 +3626,8 @@ class TaskFocusApp(ctk.CTk):
                         on_done_toggle=self._toggle_done,
                         on_focus_toggle=self._toggle_focus,
                         on_start_timer=self._start_task_timer,
-                        on_log_time=self._log_manual_time)
+                        on_log_time=self._log_manual_time,
+                        on_postpone=self._postpone_task)
         card.pack(fill="x", padx=8, pady=8)
 
     def _toggle_done(self, task):
@@ -3295,8 +3656,8 @@ class TaskFocusApp(ctk.CTk):
             self.timer_window.focus()
             return
 
-        def handle_complete(minutes):
-            self._handle_timer_completion(task.get("id"), minutes)
+        def handle_complete(minutes, ended_early):
+            self._handle_timer_completion(task.get("id"), minutes, ended_early)
 
         self.timer_window = PomodoroWindow(self, task, handle_complete, self._on_timer_closed)
         self.timer_window.focus()
@@ -3304,15 +3665,25 @@ class TaskFocusApp(ctk.CTk):
     def _on_timer_closed(self):
         self.timer_window = None
 
-    def _handle_timer_completion(self, task_id: int, minutes: int):
+    def _handle_timer_completion(self, task_id: int, minutes: int, ended_early: bool):
         self._on_timer_closed()
+        if minutes is None:
+            return
+        if minutes <= 0:
+            return
         self.bell()
         task = next((t for t in self.store.data.get("tasks", []) if t.get("id") == task_id), None)
         if not task:
             messagebox.showinfo("Timer", "Task no longer exists.")
             return
         title = task.get("title", "Task")
-        messagebox.showinfo("Time's up!", f"{minutes} minute(s) completed for '{title}'.")
+        if ended_early:
+            heading = "Session stopped"
+            body = f"Logged {minutes} minute(s) for '{title}'."
+        else:
+            heading = "Time's up!"
+            body = f"{minutes} minute(s) completed for '{title}'."
+        messagebox.showinfo(heading, body)
         dialog = SessionLogDialog(
             self,
             title=f"Session recap — {title}",
@@ -3346,6 +3717,25 @@ class TaskFocusApp(ctk.CTk):
         minutes, note = result
         self.store.append_session(task_id, minutes, note)
         self.refresh_all()
+
+    def _postpone_task(self, task):
+        task_id = task.get("id") if task else None
+        if not task_id:
+            return
+        dialog = PostponeDialog(self, task)
+        days = dialog.show()
+        if days is None:
+            return
+        current_start = parse_date(task.get("start_date", "")) or date.today()
+        base = max(current_start, date.today())
+        new_date = base + timedelta(days=days)
+        self.store.update_task(task_id, {"start_date": new_date.strftime("%Y-%m-%d")})
+        self.refresh_all()
+        title = task.get("title", "Task")
+        messagebox.showinfo(
+            "Task postponed",
+            f"'{title}' postponed until {new_date.strftime('%Y-%m-%d')}.",
+        )
 
     def _clear_add_form(self):
         self.add_title.delete(0, tk.END)
@@ -3473,6 +3863,14 @@ class TaskFocusApp(ctk.CTk):
             "focus": False,
             "description": description,
         }
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
 
     def _copy_bulk_instructions(self):
         try:
