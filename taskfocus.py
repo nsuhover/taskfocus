@@ -90,17 +90,6 @@ except ImportError:
     plt = None
     FigureCanvasTkAgg = None
 
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib import pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
-    FigureCanvasTkAgg = None
-
 # -------------------------------
 # CONFIG
 # -------------------------------
@@ -537,38 +526,6 @@ class TaskStore:
         if status in STATUSES:
             tasks = [t for t in tasks if t.get("status") == status]
         return tasks
-
-    def register_people(self, *names: str | None):
-        names_clean = [n.strip() for n in names if n and n.strip()]
-        if not names_clean:
-            return
-        current = set(self.data.get("meta", {}).get("people", []))
-        updated = False
-        for name in names_clean:
-            if name not in current:
-                current.add(name)
-                updated = True
-        if updated:
-            self.data["meta"]["people"] = sorted(current)
-
-    def get_people(self) -> list[str]:
-        return list(self.data.get("meta", {}).get("people", []))
-
-    def append_session(self, task_id: int, minutes: int, note: str):
-        for t in self.data.get("tasks", []):
-            if t.get("id") == task_id:
-                self._ensure_task_defaults(t)
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-                session_entry = {
-                    "timestamp": timestamp,
-                    "minutes": minutes,
-                    "note": note,
-                }
-                t["sessions"].append(session_entry)
-                t["time_spent_minutes"] = int(t.get("time_spent_minutes", 0)) + int(minutes)
-                self.save()
-                return session_entry
-        return None
 
     def register_people(self, *names: str | None):
         names_clean = [n.strip() for n in names if n and n.strip()]
@@ -1303,24 +1260,13 @@ class TaskCard(ctk.CTkFrame):
 
 
 class TaskEditor(ctk.CTkToplevel):
-    def __init__(self, master, task: dict, on_save, people: list[str], on_close=None):
+    def __init__(self, master, task: dict, on_save, people: list[str]):
         super().__init__(master)
         self.title("Edit Task")
         self.geometry("620x640")
         self.resizable(True, True)
-        self.transient(master)
-        self.lift()
-        self.grab_set()
-        self.focus_force()
-        try:
-            self.attributes("-topmost", True)
-            self.after(150, lambda: self.attributes("-topmost", False))
-        except tk.TclError:
-            pass
         self.task = task.copy()
         self.on_save = on_save
-        self.on_close = on_close
-        self.protocol("WM_DELETE_WINDOW", self._close)
         initial_people = {p for p in people if p}
         initial_people.update({task.get("who_asked", ""), task.get("assignee", "")})
         self.people = sorted({p for p in initial_people if p})
@@ -1418,7 +1364,7 @@ class TaskEditor(ctk.CTkToplevel):
         # Buttons
         btns = ctk.CTkFrame(container, fg_color="transparent")
         btns.grid(row=next_row + 2, column=0, columnspan=2, sticky="e", pady=(8,0))
-        ctk.CTkButton(btns, text="Cancel", command=self._close).pack(side="right", padx=6)
+        ctk.CTkButton(btns, text="Cancel", command=self.destroy).pack(side="right", padx=6)
         ctk.CTkButton(btns, text="Save", command=self._save).pack(side="right", padx=6)
 
         container.columnconfigure(0, weight=1)
@@ -1442,21 +1388,8 @@ class TaskEditor(ctk.CTkToplevel):
         if not updated["title"]:
             messagebox.showwarning("Validation", "Title cannot be empty")
             return
-        if self.on_save:
-            self.on_save(updated)
-        self._close()
-
-    def _close(self):
-        callback = self.on_close
-        self.on_close = None
-        try:
-            self.grab_release()
-        except tk.TclError:
-            pass
-        if callable(callback):
-            callback()
-        if self.winfo_exists():
-            super().destroy()
+        self.on_save(updated)
+        self.destroy()
 
     def _people_values(self) -> list[str]:
         return [""] + self.people
@@ -1600,324 +1533,6 @@ class PostponeDialog(ctk.CTkToplevel):
         self.custom_entry = ctk.CTkEntry(custom_frame, textvariable=self.custom_var)
         self.custom_entry.pack(fill="x", pady=(4, 8))
         self.custom_entry.focus_set()
-
-        self.error_label = ctk.CTkLabel(self, text="", text_color="#F87171")
-        self.error_label.pack()
-
-        btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.pack(pady=(12, 16))
-        ctk.CTkButton(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
-        ctk.CTkButton(btns, text="Apply", command=self._apply_custom).pack(side="right", padx=6)
-
-        self.bind("<Return>", self._apply_custom_event)
-        self.bind("<Escape>", self._cancel_event)
-        self.protocol("WM_DELETE_WINDOW", self._cancel)
-
-    def _select(self, days: int):
-        self.result = days
-        self.destroy()
-
-    def _apply_custom_event(self, _event=None):
-        self._apply_custom()
-
-    def _cancel_event(self, _event=None):
-        self._cancel()
-
-    def _apply_custom(self):
-        value = (self.custom_var.get() or "").strip()
-        if not value:
-            self.error_label.configure(text="Please enter the number of days to postpone.")
-            return
-        try:
-            days = int(value)
-        except ValueError:
-            self.error_label.configure(text="Enter a whole number of days.")
-            return
-        if days <= 0:
-            self.error_label.configure(text="Days must be greater than zero.")
-            return
-        self.result = days
-        self.destroy()
-
-    def _cancel(self):
-        self.result = None
-        self.destroy()
-
-    def show(self) -> int | None:
-        self.wait_window()
-        return self.result
-
-
-class PomodoroWindow(ctk.CTkToplevel):
-    def __init__(self, master, task: dict, on_complete, on_close):
-        super().__init__(master)
-        self.title(f"Timer — {task.get('title', 'Task')}")
-        self.geometry("380x280")
-        self.resizable(False, False)
-        self.on_complete = on_complete
-        self.on_close = on_close
-        self._after_id: str | None = None
-        self._timer_running = False
-        self._total_minutes = 0
-        self._remaining_seconds = 0
-        self._elapsed_seconds = 0
-
-        self.label = ctk.CTkLabel(self, text=f"Task: {task.get('title', '(no title)')}", wraplength=340)
-        self.label.pack(pady=(16, 8), padx=16)
-
-        entry_frame = ctk.CTkFrame(self, fg_color="transparent")
-        entry_frame.pack(pady=(0, 12))
-        ctk.CTkLabel(entry_frame, text="Minutes to focus:").pack(side="left", padx=(0, 8))
-        self.minutes_var = tk.StringVar(value="25")
-        self.minutes_entry = ctk.CTkEntry(entry_frame, textvariable=self.minutes_var, width=90)
-        self.minutes_entry.pack(side="left")
-
-        self.timer_label = ctk.CTkLabel(self, text="00:00", font=("Segoe UI", 28, "bold"))
-        self.timer_label.pack(pady=(0, 12))
-
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(pady=(0, 16))
-        self.start_btn = ctk.CTkButton(btn_frame, text="Start", command=self._start_timer)
-        self.start_btn.pack(side="left", padx=6)
-        self.stop_btn = ctk.CTkButton(btn_frame, text="Stop", command=self._stop_timer, state="disabled")
-        self.stop_btn.pack(side="left", padx=6)
-        self.cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=self._cancel_timer)
-        self.cancel_btn.pack(side="left", padx=6)
-
-        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
-
-    def _start_timer(self):
-        if self._timer_running:
-            return
-        try:
-            minutes = int(self.minutes_var.get())
-        except (TypeError, ValueError):
-            messagebox.showwarning("Timer", "Please enter a valid number of minutes.")
-            return
-        if minutes <= 0:
-            messagebox.showwarning("Timer", "Minutes must be greater than zero.")
-            return
-        self._total_minutes = minutes
-        self._remaining_seconds = minutes * 60
-        self._elapsed_seconds = 0
-        self._timer_running = True
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self.minutes_entry.configure(state="disabled")
-        self._tick()
-
-    def _tick(self):
-        mins, secs = divmod(self._remaining_seconds, 60)
-        self.timer_label.configure(text=f"{mins:02d}:{secs:02d}")
-        if self._remaining_seconds <= 0:
-            self._elapsed_seconds = self._total_minutes * 60
-            self._complete_session(ended_early=False)
-            return
-        self._remaining_seconds -= 1
-        self._elapsed_seconds += 1
-        self._after_id = self.after(1000, self._tick)
-
-    def _stop_timer(self):
-        if not self._timer_running:
-            return
-        if self._elapsed_seconds <= 0:
-            # Nothing tracked yet, treat as cancel.
-            self._cancel_timer()
-            return
-        minutes = max(1, math.ceil(self._elapsed_seconds / 60))
-        self._complete_session(ended_early=True, minutes_override=minutes)
-
-    def _cancel_timer(self, confirm: bool = True):
-        if self._timer_running and confirm:
-            if not messagebox.askyesno("Cancel session?", "Discard this timer session without logging time?"):
-                return
-        self._halt_timer()
-        self._close_window()
-
-    def _complete_session(self, *, ended_early: bool, minutes_override: int | None = None):
-        minutes = minutes_override if minutes_override is not None else self._total_minutes
-        self._halt_timer()
-        if self.on_complete:
-            self.on_complete(minutes, ended_early)
-        self._close_window()
-
-    def _halt_timer(self):
-        if self._after_id:
-            self.after_cancel(self._after_id)
-            self._after_id = None
-        self._timer_running = False
-        self.start_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
-        self.minutes_entry.configure(state="normal")
-
-    def _on_close_request(self):
-        if self._timer_running:
-            if not messagebox.askyesno("Cancel session?", "Timer is running. Cancel without saving?"):
-                return
-            self._cancel_timer(confirm=False)
-            return
-        self._cancel_timer(confirm=False)
-
-    def _close_window(self):
-        if self.on_close:
-            self.on_close()
-        if self.winfo_exists():
-            super().destroy()
-
-    def _people_values(self) -> list[str]:
-        return [""] + self.people
-
-    def _format_sessions(self, task: dict) -> str:
-        sessions = task.get("sessions") or []
-        if not sessions:
-            return "No sessions recorded yet."
-        lines = []
-        for session in sessions:
-            ts = session.get("timestamp", "?")
-            minutes = session.get("minutes", 0)
-            note = session.get("note", "")
-            line = f"{ts} — {minutes} min"
-            if note:
-                line += f": {note}"
-            lines.append(line)
-        return "\n".join(lines)
-
-
-class SessionLogDialog(ctk.CTkToplevel):
-    def __init__(
-        self,
-        master,
-        *,
-        title: str,
-        preset_minutes: int | None = None,
-        allow_minutes_edit: bool = True,
-        prompt: str,
-    ):
-        super().__init__(master)
-        self.title(title)
-        self.geometry("540x440")
-        self.minsize(480, 360)
-        self.transient(master)
-        self.grab_set()
-        self.result: tuple[int, str] | None = None
-
-        container = ctk.CTkFrame(self)
-        container.pack(fill="both", expand=True, padx=18, pady=18)
-
-        time_label = ctk.CTkLabel(container, text="Minutes spent", font=("Segoe UI", 14, "bold"))
-        time_label.pack(anchor="w")
-
-        self.minutes_var = tk.StringVar()
-        if preset_minutes is not None:
-            self.minutes_var.set(str(preset_minutes))
-        self.error_label = ctk.CTkLabel(container, text="", text_color="#F87171")
-        self.minutes_entry = ctk.CTkEntry(container, textvariable=self.minutes_var, font=("Segoe UI", 14))
-        self.minutes_entry.pack(fill="x", pady=(4, 12))
-        if not allow_minutes_edit and preset_minutes is not None:
-            self.minutes_entry.configure(state="disabled")
-        else:
-            self.minutes_var.trace_add("write", lambda *_: self.error_label.configure(text=""))
-
-        ctk.CTkLabel(
-            container,
-            text=prompt,
-            justify="left",
-            anchor="w",
-        ).pack(anchor="w")
-
-        self.note_box = ctk.CTkTextbox(container, height=220)
-        self.note_box.configure(font=("Segoe UI", 13), wrap="word")
-        self.note_box.pack(fill="both", expand=True, pady=(8, 12))
-
-        self.error_label.pack(anchor="w", pady=(0, 8))
-
-        btns = ctk.CTkFrame(container, fg_color="transparent")
-        btns.pack(fill="x")
-        ctk.CTkButton(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
-        ctk.CTkButton(btns, text="Save", command=self._submit).pack(side="right", padx=6)
-
-        if allow_minutes_edit and preset_minutes is None:
-            self.minutes_entry.focus_set()
-        else:
-            self.note_box.focus_set()
-
-        self.bind("<Return>", self._submit_event)
-        self.bind("<Escape>", self._cancel_event)
-        self.protocol("WM_DELETE_WINDOW", self._cancel)
-
-    def show(self) -> tuple[int, str] | None:
-        self.wait_window()
-        return self.result
-
-    def _submit_event(self, _event=None):
-        self._submit()
-
-    def _cancel_event(self, _event=None):
-        self._cancel()
-
-    def _submit(self):
-        try:
-            minutes = parse_minutes_input(self.minutes_var.get())
-        except ValueError as exc:
-            self.error_label.configure(text=str(exc))
-            return
-        note = self.note_box.get("1.0", tk.END).strip()
-        self.result = (minutes, note)
-        self.destroy()
-
-    def _cancel(self):
-        self.result = None
-        self.destroy()
-
-
-class TaskFocusApp(ctk.CTk):
-    def __init__(self, store: TaskStore):
-        super().__init__()
-        self.store = store
-        self.title(APP_TITLE)
-        self.geometry("1100x750")
-        self.minsize(720, 520)
-        self.people_options = self.store.get_people()
-        self.timer_window = None
-        self.editor_window = None
-        self._layout_mode: str | None = None
-        self._widget_scale: float | None = None
-        self._responsive_after: str | None = None
-        self._pending_width: int | None = None
-        self._today_search_job: str | None = None
-        self._all_search_job: str | None = None
-        self._refresh_job: str | None = None
-        self._stats_dirty = True
-        self._search_cache_dirty = True
-        self._search_cache: dict[int, str] = {}
-
-        self.bind("<Configure>", self._on_window_configure)
-
-        # App header
-        header = ctk.CTkFrame(self)
-        header.pack(fill="x", padx=16, pady=(16,8))
-        ctk.CTkLabel(header, text="🟣 TaskFocus", font=("Segoe UI", 20, "bold")).pack(side="left")
-        self.status_label = ctk.CTkLabel(header, text="")
-        self.status_label.pack(side="right")
-
-        # Tabs
-        self.tabs = ctk.CTkTabview(self)
-        self.tabs.pack(fill="both", expand=True, padx=16, pady=(8,16))
-        self.today_tab = self.tabs.add("Today's Tasks")
-        self.all_tab = self.tabs.add("All Tasks")
-        self.stats_tab = self.tabs.add("Statistics")
-        self.add_tab = self.tabs.add("Add Task")
-        self.bulk_tab = self.tabs.add("Bulk Import")
-
-        # Build each tab
-        self._build_today_tab()
-        self._build_all_tab()
-        self._build_stats_tab()
-        self._build_add_tab()
-        self._build_bulk_tab()
-
-        # Initial refresh
-        self.refresh_all(data_changed=True, immediate=True)
 
         self.error_label = ctk.CTkLabel(self, text="", text_color="#F87171")
         self.error_label.pack()
@@ -4280,59 +3895,12 @@ class TaskFocusApp(ctk.CTk):
             pass
 
     # ----------------------- Actions -----------------------
-    def refresh_all(self, data_changed: bool = False, immediate: bool = False):
-        if data_changed:
-            self._stats_dirty = True
-            self._search_cache_dirty = True
-        if immediate:
-            if self._refresh_job:
-                try:
-                    self.after_cancel(self._refresh_job)
-                except tk.TclError:
-                    pass
-                self._refresh_job = None
-            self._execute_refresh()
-            return
-        if self._refresh_job:
-            return
-        self._refresh_job = self.after(30, self._execute_refresh)
-
-    def _execute_refresh(self):
-        self._refresh_job = None
-        if self._search_cache_dirty:
-            self._rebuild_search_cache()
-            self._search_cache_dirty = False
+    def refresh_all(self):
         self._refresh_people_options()
         self._refresh_today_list()
         self._refresh_all_list()
         self.status_label.configure(text=f"Tasks: {len(self.store.data['tasks'])}")
-        if self._stats_dirty:
-            self._refresh_stats()
-            self._stats_dirty = False
-
-    def _rebuild_search_cache(self):
-        cache: dict[int, str] = {}
-        for task in self.store.data.get("tasks", []):
-            tid = task.get("id")
-            if not tid:
-                continue
-            cache[tid] = self._task_search_blob(task)
-        self._search_cache = cache
-
-    def _task_search_blob(self, task: dict) -> str:
-        pieces: list[str] = [
-            task.get("title", ""),
-            task.get("description", ""),
-            task.get("who_asked", ""),
-            task.get("assignee", ""),
-            task.get("type", ""),
-            task.get("priority", ""),
-            task.get("start_date", ""),
-            task.get("deadline", ""),
-        ]
-        for session in task.get("sessions", []) or []:
-            pieces.append(session.get("note", ""))
-        return " ".join(part for part in pieces if part).lower()
+        self._refresh_stats()
 
     def _on_today_search_change(self, *_):
         self._schedule_search_refresh("_today_search_job", self._refresh_today_list)
@@ -4373,13 +3941,16 @@ class TaskFocusApp(ctk.CTk):
     def _task_matches_query(self, task: dict, query: str) -> bool:
         if not query:
             return True
-        blob = self._search_cache.get(task.get("id"))
-        if blob is None:
-            blob = self._task_search_blob(task)
-            tid = task.get("id")
-            if tid:
-                self._search_cache[tid] = blob
-        combined = blob or ""
+        haystacks = [
+            task.get("title", ""),
+            task.get("description", ""),
+            task.get("who_asked", ""),
+            task.get("assignee", ""),
+            task.get("type", ""),
+        ]
+        for session in task.get("sessions", []) or []:
+            haystacks.append(session.get("note", ""))
+        combined = " ".join(text for text in haystacks if text).lower()
         query = query.lower()
         if query in combined:
             return True
@@ -4451,33 +4022,17 @@ class TaskFocusApp(ctk.CTk):
         else:
             updates["completed_at"] = None
         self.store.update_task(task["id"], updates)
-        self.refresh_all(data_changed=True)
+        self.refresh_all()
 
     def _toggle_focus(self, task):
         self.store.update_task(task["id"], {"focus": not bool(task.get("focus"))})
-        self.refresh_all(data_changed=True)
+        self.refresh_all()
 
     def _open_editor(self, task):
-        if self.editor_window and self.editor_window.winfo_exists():
-            self.editor_window.focus_force()
-            self.editor_window.lift()
-            return
-
         def on_save(updated):
             self.store.update_task(task["id"], updated)
-            self.refresh_all(data_changed=True)
-
-        def on_close():
-            self.editor_window = None
-
-        self.editor_window = TaskEditor(
-            self,
-            task,
-            on_save,
-            self.store.get_people(),
-            on_close=on_close,
-        )
-        self.editor_window.focus_force()
+            self.refresh_all()
+        TaskEditor(self, task, on_save, self.store.get_people())
 
     def _start_task_timer(self, task):
         if self.timer_window and self.timer_window.winfo_exists():
@@ -4527,7 +4082,7 @@ class TaskFocusApp(ctk.CTk):
             minutes_logged, note = minutes, ""
         # Preserve the task description and only update the dedicated session log.
         self.store.append_session(task_id, minutes_logged, note)
-        self.refresh_all(data_changed=True)
+        self.refresh_all()
 
     def _log_manual_time(self, task):
         task_id = task.get("id") if task else None
@@ -4547,7 +4102,7 @@ class TaskFocusApp(ctk.CTk):
         minutes, note = result
         # Manual logging mirrors timer sessions without touching the description field.
         self.store.append_session(task_id, minutes, note)
-        self.refresh_all(data_changed=True)
+        self.refresh_all()
 
     def _postpone_task(self, task):
         task_id = task.get("id") if task else None
@@ -4561,7 +4116,7 @@ class TaskFocusApp(ctk.CTk):
         base = max(current_start, date.today())
         new_date = base + timedelta(days=days)
         self.store.update_task(task_id, {"start_date": new_date.strftime("%Y-%m-%d")})
-        self.refresh_all(data_changed=True)
+        self.refresh_all()
         title = task.get("title", "Task")
         messagebox.showinfo(
             "Task postponed",
@@ -4597,7 +4152,7 @@ class TaskFocusApp(ctk.CTk):
         }
         self.store.add_task(task)
         self._clear_add_form()
-        self.refresh_all(data_changed=True)
+        self.refresh_all()
         self.tabs.set("All Tasks")
 
     def _bulk_import(self):
@@ -4613,7 +4168,7 @@ class TaskFocusApp(ctk.CTk):
                 self.store.add_task(task)
                 added += 1
         self.bulk_status.configure(text=f"Imported {added} task(s).")
-        self.refresh_all(data_changed=True)
+        self.refresh_all()
 
     def _parse_template_line(self, line: str) -> dict | None:
         """Parse template lines like:
@@ -4759,14 +4314,6 @@ class TaskFocusApp(ctk.CTk):
         except Exception:
             self.bulk_status.configure(text="Unable to copy instructions.")
 
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
-
     def _prompt_focus_selection(self):
         tasks = self.store.eligible_today()
         if not tasks:
@@ -4778,7 +4325,7 @@ class TaskFocusApp(ctk.CTk):
 
         def on_confirm(selected_ids: list[int]):
             self.store.set_focus_for_today(selected_ids)
-            self.refresh_all(data_changed=True)
+            self.refresh_all()
 
         FocusDialog(self, tasks, on_confirm)
 
