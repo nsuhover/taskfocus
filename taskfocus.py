@@ -124,6 +124,17 @@ except ImportError:
     plt = None
     FigureCanvasTkAgg = None
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
 # -------------------------------
 # CONFIG
 # -------------------------------
@@ -670,6 +681,24 @@ class TaskStore:
                 return t
         return None
 
+    def set_plan_completion(self, task_id: int, item_id: str, completed: bool):
+        for t in self.data["tasks"]:
+            if t.get("id") != task_id:
+                continue
+            self._ensure_task_defaults(t)
+            for item in t.get("plan", []):
+                if item.get("id") != item_id:
+                    continue
+                item["completed"] = bool(completed)
+                if completed:
+                    item["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                else:
+                    item["completed_at"] = None
+                item["completed_by"] = None
+                self.save()
+                return item
+        return None
+
     def delete_task(self, task_id: int):
         self.data["tasks"] = [t for t in self.data["tasks"] if t.get("id") != task_id]
         self.save()
@@ -795,6 +824,7 @@ class TaskCard(ctk.CTkFrame):
         on_focus_toggle,
         on_start_timer,
         on_log_time,
+        on_plan_toggle,
         on_postpone,
     ):
         super().__init__(master)
@@ -804,9 +834,10 @@ class TaskCard(ctk.CTkFrame):
         self.on_focus_toggle = on_focus_toggle
         self.on_start_timer = on_start_timer
         self.on_log_time = on_log_time
+        self.on_plan_toggle = on_plan_toggle
         self.on_postpone = on_postpone
         self._layout_mode: str | None = None
-        self.plan_labels: list[ctk.CTkLabel] = []
+        self.plan_checks: dict[str, tuple[ctk.CTkCheckBox, tk.BooleanVar]] = {}
 
         self.configure(
             fg_color="#0F172A",
@@ -916,19 +947,20 @@ class TaskCard(ctk.CTkFrame):
             plan_frame = ctk.CTkFrame(self.left_frame, fg_color="#111827")
             plan_frame.pack(fill="x", pady=(0, 4))
             for item in plan_items:
-                completed = bool(item.get("completed"))
-                icon = "☑" if completed else "☐"
-                color = "#34D399" if completed else "#E5E7EB"
-                label = ctk.CTkLabel(
+                item_id = item.get("id")
+                if not item_id:
+                    continue
+                var = tk.BooleanVar(value=bool(item.get("completed")))
+                checkbox = ctk.CTkCheckBox(
                     plan_frame,
-                    text=f"{icon} {item.get('text', '')}",
-                    anchor="w",
-                    justify="left",
+                    text=item.get("text", ""),
+                    variable=var,
                     wraplength=520,
-                    text_color=color,
+                    command=lambda iid=item_id, v=var: self._on_plan_checkbox(iid, v),
                 )
-                label.pack(anchor="w", padx=10, pady=2)
-                self.plan_labels.append(label)
+                checkbox.pack(anchor="w", padx=12, pady=4)
+                self.plan_checks[item_id] = (checkbox, var)
+                self._style_plan_checkbox(item_id)
 
         self.links = gather_task_links(task)
         self.links_frame: ctk.CTkFrame | None = None
@@ -1086,12 +1118,34 @@ class TaskCard(ctk.CTkFrame):
         wrap = max(width - 120, 260)
         self.title_label.configure(wraplength=wrap)
         self.meta_line.configure(wraplength=wrap)
-        for label in self.plan_labels:
-            label.configure(wraplength=wrap)
+        for checkbox, _ in self.plan_checks.values():
+            checkbox.configure(wraplength=wrap)
 
         mode = "stacked" if width < 860 else "inline"
         if mode != self._layout_mode:
             self._arrange_buttons(mode)
+
+    def _style_plan_checkbox(self, item_id: str) -> None:
+        checkbox, var = self.plan_checks.get(item_id, (None, None))
+        if not checkbox or not var:
+            return
+        checked = bool(var.get())
+        text_color = "#34D399" if checked else "#E5E7EB"
+        checkbox.configure(text_color=text_color)
+
+    def _on_plan_checkbox(self, item_id: str, var: tk.BooleanVar) -> None:
+        checked = bool(var.get())
+        success = True
+        if callable(getattr(self, "on_plan_toggle", None)):
+            success = self.on_plan_toggle(self.task, item_id, checked)
+        if success is False:
+            var.set(not checked)
+        else:
+            for item in self.task.get("plan", []) or []:
+                if item.get("id") == item_id:
+                    item["completed"] = bool(var.get())
+                    break
+        self._style_plan_checkbox(item_id)
 
 
 class TaskEditor(ctk.CTkToplevel):
@@ -2963,6 +3017,7 @@ class TaskFocusApp(ctk.CTk):
                         on_focus_toggle=self._toggle_focus,
                         on_start_timer=self._start_task_timer,
                         on_log_time=self._log_manual_time,
+                        on_plan_toggle=self._toggle_plan_item,
                         on_postpone=self._postpone_task)
         card.pack(fill="x", padx=12, pady=10)
 
@@ -2979,6 +3034,14 @@ class TaskFocusApp(ctk.CTk):
     def _toggle_focus(self, task):
         self.store.update_task(task["id"], {"focus": not bool(task.get("focus"))})
         self.refresh_all(data_changed=True)
+
+    def _toggle_plan_item(self, task, item_id: str, completed: bool):
+        result = self.store.set_plan_completion(task["id"], item_id, completed)
+        if result is None:
+            messagebox.showwarning("Plan", "Unable to update plan step.")
+            return False
+        self.refresh_all(data_changed=True)
+        return True
 
     def _open_editor(self, task):
         if self.editor_window and self.editor_window.winfo_exists():
@@ -3223,6 +3286,14 @@ class TaskFocusApp(ctk.CTk):
             "focus": False,
             "description": description,
         }
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
 
     def _copy_bulk_instructions(self):
         try:
