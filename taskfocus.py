@@ -135,6 +135,17 @@ except ImportError:
     plt = None
     FigureCanvasTkAgg = None
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
 # -------------------------------
 # CONFIG
 # -------------------------------
@@ -1409,29 +1420,56 @@ class PlanEditorFrame(ctk.CTkFrame):
     def __init__(self, master, plan_items: list[dict] | None = None):
         super().__init__(master, fg_color="#111827", corner_radius=12)
         self._rows: list[dict] = []
-        self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self.scroll.pack(fill="both", expand=True, padx=12, pady=12)
-        btn_row = ctk.CTkFrame(self, fg_color="transparent")
-        btn_row.pack(fill="x", padx=12, pady=(0, 12))
+
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(12, 0))
         ctk.CTkButton(
-            btn_row,
+            header,
             text="Add step",
             command=self._add_empty_row,
             width=120,
         ).pack(side="left")
+        ctk.CTkLabel(
+            header,
+            text="Build a step-by-step checklist to finish the task.",
+            text_color="#94A3B8",
+        ).pack(side="left", padx=(12, 0))
+
+        self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.scroll.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+        self._scroll_container = getattr(self.scroll, "scrollable_frame", self.scroll)
+        self.empty_label = ctk.CTkLabel(
+            self._scroll_container,
+            text="No plan steps yet. Click “Add step” to create your first item.",
+            text_color="#9CA3AF",
+            justify="left",
+            wraplength=420,
+        )
+        self.empty_label.pack(fill="x", padx=8, pady=12)
+        self.empty_label.bind("<Button-1>", lambda _event: self._add_empty_row())
+        self.empty_label.configure(cursor="hand2")
+
         self.load_plan(plan_items or [])
 
     def load_plan(self, plan_items: list[dict]):
         for row in self._rows:
             row["frame"].destroy()
         self._rows.clear()
+        added = False
         for item in plan_items:
-            self._add_row(item)
+            if not item:
+                continue
+            self._add_row(item, focus=False)
+            added = True
+        if not added:
+            self._update_empty_state()
 
     def get_plan(self) -> list[dict]:
         results: list[dict] = []
         for row in self._rows:
             text = row["entry"].get().strip()
+            if not text:
+                continue
             completed = bool(row["var"].get())
             item = {
                 "id": row.get("id"),
@@ -1444,15 +1482,16 @@ class PlanEditorFrame(ctk.CTkFrame):
         return results
 
     def _add_empty_row(self):
-        self._add_row({"text": "", "completed": False})
+        self._add_row({"text": "", "completed": False}, focus=True)
 
-    def _add_row(self, item: dict):
-        frame = ctk.CTkFrame(self.scroll, fg_color="#0F172A")
+    def _add_row(self, item: dict, *, focus: bool = True):
+        frame_parent = self._scroll_container
+        frame = ctk.CTkFrame(frame_parent, fg_color="#0F172A")
         frame.pack(fill="x", pady=4, padx=4)
         var = tk.BooleanVar(value=bool(item.get("completed")))
         chk = ctk.CTkCheckBox(frame, text="", variable=var, width=20)
         chk.pack(side="left", padx=(8, 4))
-        entry = ctk.CTkEntry(frame)
+        entry = ctk.CTkEntry(frame, placeholder_text="Describe the step…")
         entry.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=6)
         entry.insert(0, item.get("text", ""))
         remove_btn = ctk.CTkButton(
@@ -1464,16 +1503,18 @@ class PlanEditorFrame(ctk.CTkFrame):
             command=lambda f=frame: self._remove_row(f),
         )
         remove_btn.pack(side="right", padx=(4, 8))
-        self._rows.append(
-            {
-                "frame": frame,
-                "var": var,
-                "entry": entry,
-                "id": item.get("id"),
-                "completed_at": item.get("completed_at"),
-                "completed_by": item.get("completed_by"),
-            }
-        )
+        row = {
+            "frame": frame,
+            "var": var,
+            "entry": entry,
+            "id": item.get("id"),
+            "completed_at": item.get("completed_at"),
+            "completed_by": item.get("completed_by"),
+        }
+        self._rows.append(row)
+        self._update_empty_state()
+        if focus:
+            entry.focus_set()
 
     def _remove_row(self, frame):
         for idx, row in enumerate(self._rows):
@@ -1481,6 +1522,16 @@ class PlanEditorFrame(ctk.CTkFrame):
                 frame.destroy()
                 self._rows.pop(idx)
                 break
+        self._update_empty_state()
+
+    def _update_empty_state(self):
+        has_rows = bool(self._rows)
+        if has_rows:
+            if self.empty_label.winfo_manager():
+                self.empty_label.pack_forget()
+        else:
+            if not self.empty_label.winfo_manager():
+                self.empty_label.pack(fill="x", padx=8, pady=12)
 
 
 class SessionLogDialog(ctk.CTkToplevel):
@@ -3286,6 +3337,14 @@ class TaskFocusApp(ctk.CTk):
             "focus": False,
             "description": description,
         }
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
 
     def _copy_bulk_instructions(self):
         try:
