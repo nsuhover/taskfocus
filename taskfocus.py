@@ -58,6 +58,94 @@ except ImportError:
     plt = None
     FigureCanvasTkAgg = None
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
 # -------------------------------
 # CONFIG
 # -------------------------------
@@ -3249,6 +3337,102 @@ class TaskFocusApp(ctk.CTk):
             "focus": False,
             "description": description,
         }
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
 
     def _copy_bulk_instructions(self):
         try:
