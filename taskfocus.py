@@ -146,6 +146,17 @@ except ImportError:
     plt = None
     FigureCanvasTkAgg = None
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
 # -------------------------------
 # CONFIG
 # -------------------------------
@@ -848,7 +859,7 @@ class TaskCard(ctk.CTkFrame):
         self.on_plan_toggle = on_plan_toggle
         self.on_postpone = on_postpone
         self._layout_mode: str | None = None
-        self.plan_checks: dict[str, tuple[ctk.CTkCheckBox, tk.BooleanVar]] = {}
+        self.plan_checks: dict[str, dict[str, object]] = {}
 
         self.configure(
             fg_color="#0F172A",
@@ -955,22 +966,43 @@ class TaskCard(ctk.CTkFrame):
                 font=("Segoe UI", 13, "bold"),
             )
             plan_label.pack(anchor="w", pady=(8, 2))
-            plan_frame = ctk.CTkFrame(self.left_frame, fg_color="#111827")
+            plan_frame = ctk.CTkFrame(
+                self.left_frame,
+                fg_color="#111827",
+                corner_radius=12,
+                border_width=1,
+                border_color="#1E293B",
+            )
             plan_frame.pack(fill="x", pady=(0, 4))
             for item in plan_items:
-                item_id = item.get("id")
-                if not item_id:
-                    continue
+                item_id = item.get("id") or uuid.uuid4().hex
+                if not item.get("id"):
+                    item["id"] = item_id
                 var = tk.BooleanVar(value=bool(item.get("completed")))
+                row = ctk.CTkFrame(plan_frame, fg_color="transparent")
+                row.pack(fill="x", padx=10, pady=4)
                 checkbox = ctk.CTkCheckBox(
-                    plan_frame,
-                    text=item.get("text", ""),
+                    row,
+                    text="",
+                    width=28,
                     variable=var,
-                    wraplength=520,
                     command=lambda iid=item_id, v=var: self._on_plan_checkbox(iid, v),
                 )
-                checkbox.pack(anchor="w", padx=12, pady=4)
-                self.plan_checks[item_id] = (checkbox, var)
+                checkbox.pack(side="left", padx=(4, 8))
+                label = ctk.CTkLabel(
+                    row,
+                    text=item.get("text", ""),
+                    anchor="w",
+                    justify="left",
+                    wraplength=520,
+                )
+                label.pack(side="left", fill="x", expand=True)
+                label.bind(
+                    "<Button-1>",
+                    lambda _e, iid=item_id, v=var: self._toggle_plan_from_label(iid, v),
+                )
+                label.configure(cursor="hand2")
+                self.plan_checks[item_id] = {"checkbox": checkbox, "var": var, "label": label}
                 self._style_plan_checkbox(item_id)
 
         self.links = gather_task_links(task)
@@ -1129,20 +1161,26 @@ class TaskCard(ctk.CTkFrame):
         wrap = max(width - 120, 260)
         self.title_label.configure(wraplength=wrap)
         self.meta_line.configure(wraplength=wrap)
-        for checkbox, _ in self.plan_checks.values():
-            checkbox.configure(wraplength=wrap)
+        for data in self.plan_checks.values():
+            data["label"].configure(wraplength=max(wrap - 60, 200))
 
         mode = "stacked" if width < 860 else "inline"
         if mode != self._layout_mode:
             self._arrange_buttons(mode)
 
     def _style_plan_checkbox(self, item_id: str) -> None:
-        checkbox, var = self.plan_checks.get(item_id, (None, None))
-        if not checkbox or not var:
+        record = self.plan_checks.get(item_id)
+        if not record:
             return
+        checkbox = record["checkbox"]
+        var = record["var"]
+        label = record["label"]
         checked = bool(var.get())
-        text_color = "#34D399" if checked else "#E5E7EB"
-        checkbox.configure(text_color=text_color)
+        accent = "#34D399" if checked else "#E5E7EB"
+        checkbox.configure(fg_color="#34D399" if checked else "#1F2937")
+        checkbox.configure(hover_color="#059669" if checked else "#334155")
+        checkbox.configure(border_color="#34D399" if checked else "#475569")
+        label.configure(text_color=accent)
 
     def _on_plan_checkbox(self, item_id: str, var: tk.BooleanVar) -> None:
         checked = bool(var.get())
@@ -1157,6 +1195,10 @@ class TaskCard(ctk.CTkFrame):
                     item["completed"] = bool(var.get())
                     break
         self._style_plan_checkbox(item_id)
+
+    def _toggle_plan_from_label(self, item_id: str, var: tk.BooleanVar) -> None:
+        var.set(not bool(var.get()))
+        self._on_plan_checkbox(item_id, var)
 
 
 class TaskEditor(ctk.CTkToplevel):
@@ -3337,6 +3379,14 @@ class TaskFocusApp(ctk.CTk):
             "focus": False,
             "description": description,
         }
+
+    def _copy_bulk_instructions(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.bulk_instruction_text)
+            self.bulk_status.configure(text="Instructions copied.")
+        except Exception:
+            self.bulk_status.configure(text="Unable to copy instructions.")
 
     def _copy_bulk_instructions(self):
         try:
