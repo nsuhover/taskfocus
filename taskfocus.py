@@ -157,6 +157,17 @@ except ImportError:
     plt = None
     FigureCanvasTkAgg = None
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    FigureCanvasTkAgg = None
+
 # -------------------------------
 # CONFIG
 # -------------------------------
@@ -255,6 +266,22 @@ def parse_date(s: str):
 
 def today_str():
     return date.today().strftime("%Y-%m-%d")
+
+
+def format_minutes(minutes: int | float | None) -> str:
+    """Return a human friendly string such as ``2h 15m`` or ``45m``."""
+    try:
+        total = int(minutes or 0)
+    except Exception:
+        total = 0
+    if total <= 0:
+        return "0m"
+    hours, mins = divmod(total, 60)
+    if hours and mins:
+        return f"{hours}h {mins}m"
+    if hours:
+        return f"{hours}h"
+    return f"{mins}m"
 
 
 PRIORITY_ORDER = {"High": 0, "Medium": 1, "Low": 2}
@@ -516,7 +543,10 @@ def parse_minutes_input(raw: str) -> int:
 class TaskStore:
     def __init__(self, path):
         self.path = path
-        self.data = {"tasks": [], "meta": {"last_focus_date": None, "people": []}}
+        self.data = {
+            "tasks": [],
+            "meta": {"last_focus_date": None, "people": [], "labels": []},
+        }
         self.load()
 
     def load(self):
@@ -528,13 +558,16 @@ class TaskStore:
                 self.data = json.load(f)
             # Backward compatibility
             if "meta" not in self.data:
-                self.data["meta"] = {"last_focus_date": None, "people": []}
+                self.data["meta"] = {"last_focus_date": None, "people": [], "labels": []}
             if "people" not in self.data.get("meta", {}):
                 self.data["meta"]["people"] = []
+            if "labels" not in self.data.get("meta", {}):
+                self.data["meta"]["labels"] = []
             # Ensure defaults on old tasks
             for task in self.data.get("tasks", []):
                 self._ensure_task_defaults(task)
                 self.register_people(task.get("who_asked"), task.get("assignee"))
+                self.register_labels(*(task.get("labels") or []))
         except Exception:
             # Create fresh if corrupted
             self.data = {"tasks": [], "meta": {"last_focus_date": None, "people": []}}
@@ -546,6 +579,20 @@ class TaskStore:
             json.dump(self.data, f, indent=2, ensure_ascii=False)
 
     # --- Task operations ---
+    def _normalize_labels(self, labels: list[str] | tuple[str, ...] | None) -> list[str]:
+        cleaned: list[str] = []
+        if not labels:
+            return cleaned
+        for label in labels:
+            if label is None:
+                continue
+            text = str(label).strip()
+            if not text:
+                continue
+            if text not in cleaned:
+                cleaned.append(text)
+        return cleaned
+
     def _ensure_task_defaults(self, task: dict):
         task.setdefault("description", "")
         task.setdefault("assignee", "")
@@ -557,6 +604,7 @@ class TaskStore:
         task["sessions"] = normalized_sessions
         plan_items = task.get("plan") or []
         task["plan"] = [self._ensure_plan_item_defaults(item) for item in plan_items]
+        task["labels"] = self._normalize_labels(task.get("labels"))
         self._recalculate_time_spent(task)
         task.setdefault("completed_at", None)
         return task
@@ -684,8 +732,10 @@ class TaskStore:
         task.setdefault("focus", False)
         task.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
         task.setdefault("completed_at", None)
+        task["labels"] = self._normalize_labels(task.get("labels"))
         self.data["tasks"].append(self._ensure_task_defaults(task))
         self.register_people(task.get("who_asked"), task.get("assignee"))
+        self.register_labels(*(task.get("labels") or []))
         self.save()
         return task
 
@@ -694,11 +744,14 @@ class TaskStore:
         for t in self.data["tasks"]:
             if t.get("id") == task_id:
                 plan_updates = updates.pop("plan", None)
+                if "labels" in updates:
+                    updates["labels"] = self._normalize_labels(updates["labels"])
                 t.update(updates)
                 if plan_updates is not None:
                     self._merge_plan_items(t, plan_updates)
                 self._ensure_task_defaults(t)
                 self.register_people(t.get("who_asked"), t.get("assignee"))
+                self.register_labels(*(t.get("labels") or []))
                 self.save()
                 return t
         return None
@@ -752,6 +805,22 @@ class TaskStore:
 
     def get_people(self) -> list[str]:
         return list(self.data.get("meta", {}).get("people", []))
+
+    def register_labels(self, *labels: str | None):
+        labels_clean = [lbl.strip() for lbl in labels if lbl and lbl.strip()]
+        if not labels_clean:
+            return
+        current = set(self.data.get("meta", {}).get("labels", []))
+        updated = False
+        for label in labels_clean:
+            if label not in current:
+                current.add(label)
+                updated = True
+        if updated:
+            self.data.setdefault("meta", {})["labels"] = sorted(current)
+
+    def get_labels(self) -> list[str]:
+        return list(self.data.get("meta", {}).get("labels", []))
 
     def append_session(
         self,
@@ -848,6 +917,9 @@ class TaskCard(ctk.CTkFrame):
         on_log_time,
         on_plan_toggle,
         on_postpone,
+        on_select=None,
+        *,
+        selected: bool = False,
     ):
         super().__init__(master)
         self.task = task
@@ -858,14 +930,18 @@ class TaskCard(ctk.CTkFrame):
         self.on_log_time = on_log_time
         self.on_plan_toggle = on_plan_toggle
         self.on_postpone = on_postpone
+        self.on_select = on_select
         self._layout_mode: str | None = None
         self.plan_checks: dict[str, dict[str, object]] = {}
+        self._selected = bool(selected)
+        self._default_border_color = "#312E81"
+        self._selected_border_color = "#6366F1"
 
         self.configure(
             fg_color="#0F172A",
             corner_radius=18,
             border_width=1,
-            border_color="#312E81",
+            border_color=self._default_border_color,
         )
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -938,6 +1014,33 @@ class TaskCard(ctk.CTkFrame):
             meta_text = f"Start: {sd} | {dl_text}"
         self.meta_line = ctk.CTkLabel(self.left_frame, text=meta_text, justify="left", anchor="w")
         self.meta_line.pack(anchor="w", pady=(6, 0))
+
+        labels = [lbl for lbl in (task.get("labels") or []) if lbl]
+        self.labels_frame: ctk.CTkFrame | None = None
+        if labels:
+            labels_container = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+            labels_container.pack(anchor="w", pady=(6, 0), fill="x")
+            ctk.CTkLabel(
+                labels_container,
+                text="Labels:",
+                font=("Segoe UI", 12, "bold"),
+                text_color="#A5B4FC",
+            ).pack(side="left", padx=(0, 6))
+            self.labels_frame = ctk.CTkFrame(labels_container, fg_color="transparent")
+            self.labels_frame.pack(side="left", fill="x", expand=True)
+            for label in labels:
+                pill = ctk.CTkFrame(
+                    self.labels_frame,
+                    fg_color="#1D4ED8",
+                    corner_radius=12,
+                )
+                pill.pack(side="left", padx=2, pady=2)
+                ctk.CTkLabel(
+                    pill,
+                    text=label,
+                    font=("Segoe UI", 12),
+                    text_color="#E0E7FF",
+                ).pack(padx=8, pady=(2, 3))
 
         desc_text = (task.get("description") or "").strip()
         self.desc_box: ctk.CTkTextbox | None = None
@@ -1111,6 +1214,10 @@ class TaskCard(ctk.CTkFrame):
         self._arrange_buttons("inline")
 
         self.bind("<Configure>", self._on_configure)
+        self.bind("<Button-1>", self._handle_click, add="+")
+        self.left_frame.bind("<Button-1>", self._handle_click, add="+")
+        self.btns_frame.bind("<Button-1>", self._handle_click, add="+")
+        self.set_selected(self._selected)
 
     def _open_link(self, url: str):
         webbrowser.open(url)
@@ -1200,7 +1307,390 @@ class TaskCard(ctk.CTkFrame):
         var.set(not bool(var.get()))
         self._on_plan_checkbox(item_id, var)
 
+    def _handle_click(self, event):
+        if callable(self.on_select):
+            self.on_select(self, event)
 
+    def set_selected(self, selected: bool) -> None:
+        self._selected = bool(selected)
+        border = self._selected_border_color if self._selected else self._default_border_color
+        self.configure(border_color=border)
+
+
+class TaskPreviewPane(ctk.CTkFrame):
+    def __init__(self, master):
+        super().__init__(
+            master,
+            fg_color="#0B1220",
+            corner_radius=18,
+            border_width=1,
+            border_color="#1E293B",
+        )
+        self.grid_propagate(False)
+
+        self.placeholder = ctk.CTkLabel(
+            self,
+            text="Select a task to see the full description, sessions, and links.",
+            text_color="#94A3B8",
+            justify="center",
+            wraplength=320,
+        )
+        self.placeholder.pack(expand=True, padx=16, pady=16)
+
+        self.content = ctk.CTkFrame(self, fg_color="transparent")
+        self.content.grid_columnconfigure(0, weight=1)
+
+        self.title_label = ctk.CTkLabel(
+            self.content,
+            text="",
+            font=("Segoe UI", 18, "bold"),
+            justify="left",
+            anchor="w",
+        )
+        self.title_label.pack(anchor="w", padx=16, pady=(16, 4))
+
+        self.meta_label = ctk.CTkLabel(
+            self.content,
+            text="",
+            justify="left",
+            anchor="w",
+        )
+        self.meta_label.pack(anchor="w", padx=16)
+
+        self.labels_holder = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.labels_holder.pack(anchor="w", padx=16, pady=(8, 0))
+
+        self.description_label = ctk.CTkLabel(
+            self.content,
+            text="Description",
+            font=("Segoe UI", 13, "bold"),
+            anchor="w",
+        )
+        self.description_label.pack(anchor="w", padx=16, pady=(12, 4))
+
+        self.description_text = ctk.CTkTextbox(self.content, height=150)
+        self.description_text.pack(fill="x", padx=16)
+        self.description_text.insert("1.0", "")
+        make_textbox_copyable(self.description_text)
+
+        self.plan_label = ctk.CTkLabel(
+            self.content,
+            text="Plan",
+            font=("Segoe UI", 13, "bold"),
+            anchor="w",
+        )
+        self.plan_items_container = ctk.CTkFrame(
+            self.content,
+            fg_color="#111827",
+            corner_radius=12,
+            border_width=1,
+            border_color="#1F2937",
+        )
+        self.plan_label.pack(anchor="w", padx=16, pady=(12, 4))
+        self.plan_items_container.pack(fill="x", padx=16)
+
+        self.sessions_label = ctk.CTkLabel(
+            self.content,
+            text="Sessions",
+            font=("Segoe UI", 13, "bold"),
+            anchor="w",
+        )
+        self.sessions_label.pack(anchor="w", padx=16, pady=(12, 4))
+
+        self.sessions_text = ctk.CTkTextbox(self.content, height=170)
+        self.sessions_text.pack(fill="both", expand=True, padx=16)
+        self.sessions_text.insert("1.0", "")
+        make_textbox_copyable(self.sessions_text)
+
+        self.links_label = ctk.CTkLabel(
+            self.content,
+            text="Links",
+            font=("Segoe UI", 13, "bold"),
+            anchor="w",
+        )
+        self.links_frame = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.links_label.pack(anchor="w", padx=16, pady=(12, 4))
+        self.links_frame.pack(fill="x", padx=16, pady=(0, 16))
+
+        self.current_task_id: int | None = None
+        self.show_task(None)
+
+    def show_task(self, task: dict | None):
+        if not task:
+            self.current_task_id = None
+            self._hide_content()
+            return
+
+        if not self.content.winfo_ismapped():
+            self.placeholder.pack_forget()
+            self.content.pack(fill="both", expand=True)
+
+        self.current_task_id = task.get("id")
+        title = task.get("title", "Task")
+        status = task.get("status", "open").capitalize()
+        priority = task.get("priority", "Medium")
+        task_type = task.get("type", "Make")
+        who = task.get("who_asked") or "—"
+        assignee = task.get("assignee") or "—"
+        start = task.get("start_date") or "—"
+        deadline = task.get("deadline") or "—"
+        total_minutes = int(task.get("time_spent_minutes", 0) or 0)
+
+        meta_lines = [
+            f"Type: {task_type} | Priority: {priority} | Status: {status}",
+            f"Asked by: {who} | Assignee: {assignee}",
+            f"Start: {start} | Deadline: {deadline}",
+            f"Total time: {format_minutes(total_minutes)}",
+        ]
+
+        self.title_label.configure(text=title)
+        self.meta_label.configure(text="\n".join(meta_lines))
+
+        self._render_labels(task.get("labels") or [])
+
+        description = (task.get("description") or "").strip() or "No description provided."
+        self._set_text(self.description_text, description)
+
+        plan_items = [item for item in (task.get("plan") or []) if item.get("text")]
+        self._render_plan(plan_items)
+
+        sessions_text = self._format_sessions(task)
+        self._set_text(self.sessions_text, sessions_text)
+
+        links = gather_task_links(task)
+        self._render_links(links)
+
+    def _hide_content(self):
+        if self.content.winfo_ismapped():
+            self.content.pack_forget()
+        if not self.placeholder.winfo_ismapped():
+            self.placeholder.pack(expand=True, padx=16, pady=16)
+
+    def _set_text(self, widget: ctk.CTkTextbox, value: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", value)
+        widget.configure(state="disabled")
+
+    def _render_labels(self, labels: list[str]):
+        for child in self.labels_holder.winfo_children():
+            child.destroy()
+        if not labels:
+            return
+        ctk.CTkLabel(
+            self.labels_holder,
+            text="Labels:",
+            font=("Segoe UI", 12, "bold"),
+            text_color="#A5B4FC",
+        ).pack(side="left", padx=(0, 6))
+        for label in labels:
+            pill = ctk.CTkFrame(self.labels_holder, fg_color="#1D4ED8", corner_radius=12)
+            pill.pack(side="left", padx=2)
+            ctk.CTkLabel(
+                pill,
+                text=label,
+                font=("Segoe UI", 12),
+                text_color="#E0E7FF",
+            ).pack(padx=8, pady=(2, 3))
+
+    def _render_plan(self, plan_items: list[dict]):
+        for child in self.plan_items_container.winfo_children():
+            child.destroy()
+        if not plan_items:
+            self.plan_label.pack_forget()
+            self.plan_items_container.pack_forget()
+            return
+        if not self.plan_label.winfo_ismapped():
+            self.plan_label.pack(anchor="w", padx=16, pady=(12, 4))
+            self.plan_items_container.pack(fill="x", padx=16)
+        for item in plan_items:
+            row = ctk.CTkFrame(self.plan_items_container, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=4)
+            icon = "✅" if item.get("completed") else "⬜"
+            when = item.get("completed_at")
+            text = item.get("text", "")
+            if when:
+                label_text = f"{icon} {text} (done {when})"
+            else:
+                label_text = f"{icon} {text}"
+            ctk.CTkLabel(row, text=label_text, anchor="w", justify="left", wraplength=360).pack(fill="x")
+
+    def _render_links(self, links: list[str]):
+        for child in self.links_frame.winfo_children():
+            child.destroy()
+        if not links:
+            self.links_label.pack_forget()
+            self.links_frame.pack_forget()
+            return
+        if not self.links_label.winfo_ismapped():
+            self.links_label.pack(anchor="w", padx=16, pady=(12, 4))
+            self.links_frame.pack(fill="x", padx=16, pady=(0, 16))
+        for url in links:
+            btn = ctk.CTkButton(
+                self.links_frame,
+                text=f"🔗 {shorten_url_display(url)}",
+                command=lambda url=url: webbrowser.open(url),
+                height=32,
+                width=0,
+                fg_color="#1E3A8A",
+                hover_color="#1D4ED8",
+                text_color="#E0E7FF",
+                font=("Segoe UI", 13),
+            )
+            btn.pack(fill="x", pady=2)
+
+    def _format_sessions(self, task: dict) -> str:
+        sessions = task.get("sessions") or []
+        if not sessions:
+            return "No sessions recorded yet."
+        lines = []
+        for session in sessions:
+            ts = session.get("timestamp", "?")
+            minutes = session.get("minutes", 0)
+            note = session.get("note", "")
+            line = f"{ts} — {minutes} min"
+            if note:
+                line += f": {note}"
+            plan_ids = session.get("plan_items") or []
+            if plan_ids:
+                related = [
+                    item.get("text", "")
+                    for item in task.get("plan", [])
+                    if item.get("id") in plan_ids
+                ]
+                related = [text for text in related if text]
+                if related:
+                    line += f" [Plan: {', '.join(related)}]"
+            lines.append(line)
+        return "\n".join(lines)
+
+
+class LabelsEditor(ctk.CTkFrame):
+    def __init__(self, master, labels: list[str] | None = None, suggestions: list[str] | None = None):
+        super().__init__(master, fg_color="#111827", corner_radius=12)
+        self.grid_columnconfigure(0, weight=1)
+        self._labels: list[str] = []
+        self._suggestions: list[str] = sorted({lbl for lbl in suggestions or [] if lbl})
+
+        entry_row = ctk.CTkFrame(self, fg_color="transparent")
+        entry_row.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 4))
+        entry_row.grid_columnconfigure(0, weight=1)
+
+        self.entry = ctk.CTkEntry(entry_row, placeholder_text="Add a label…")
+        self.entry.grid(row=0, column=0, sticky="ew")
+        self.entry.bind("<Return>", lambda _event: self._add_from_entry())
+
+        self.add_btn = ctk.CTkButton(entry_row, text="Add", width=72, command=self._add_from_entry)
+        self.add_btn.grid(row=0, column=1, padx=(8, 0))
+
+        self.suggestion_menu = ctk.CTkOptionMenu(
+            self,
+            values=self._menu_values(),
+            command=self._add_from_menu,
+            width=160,
+        )
+        self.suggestion_menu.grid(row=1, column=0, sticky="ew", padx=12)
+        self.suggestion_menu.set(self._menu_placeholder())
+
+        self.tokens_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.tokens_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(12, 12))
+        self.tokens_frame.grid_columnconfigure(0, weight=1)
+
+        self.empty_label = ctk.CTkLabel(
+            self.tokens_frame,
+            text="No labels yet. Use the field above to add keywords.",
+            text_color="#9CA3AF",
+            wraplength=320,
+        )
+        self.empty_label.grid(row=0, column=0, sticky="w")
+
+        self._token_container = ctk.CTkFrame(self.tokens_frame, fg_color="transparent")
+        self._token_container.grid(row=0, column=0, sticky="w")
+
+        self.set_labels(labels or [])
+
+    def _menu_placeholder(self) -> str:
+        return "Select label…"
+
+    def _menu_values(self) -> list[str]:
+        base = [self._menu_placeholder()]
+        base.extend(self._suggestions)
+        return base
+
+    def _add_from_entry(self):
+        text = self.entry.get().strip()
+        if self._add_label(text):
+            self.entry.delete(0, tk.END)
+
+    def _add_from_menu(self, value: str):
+        if value == self._menu_placeholder():
+            return
+        added = self._add_label(value)
+        if added:
+            self.suggestion_menu.set(self._menu_placeholder())
+
+    def _add_label(self, value: str | None) -> bool:
+        if not value:
+            return False
+        cleaned = value.strip()
+        if not cleaned:
+            return False
+        if cleaned in self._labels:
+            return False
+        self._labels.append(cleaned)
+        self._labels.sort()
+        self._refresh_tokens()
+        return True
+
+    def _remove_label(self, value: str):
+        self._labels = [lbl for lbl in self._labels if lbl != value]
+        self._refresh_tokens()
+
+    def _refresh_tokens(self):
+        for child in self._token_container.winfo_children():
+            child.destroy()
+        if not self._labels:
+            self._token_container.grid_remove()
+            self.empty_label.grid()
+            return
+        self.empty_label.grid_remove()
+        self._token_container.grid()
+        for idx, label in enumerate(self._labels):
+            pill = ctk.CTkFrame(self._token_container, fg_color="#1F2937", corner_radius=14)
+            pill.grid(row=0, column=idx, padx=4, pady=4, sticky="w")
+            text_label = ctk.CTkLabel(pill, text=label, text_color="#E2E8F0")
+            text_label.pack(side="left", padx=(8, 4), pady=4)
+            remove_btn = ctk.CTkButton(
+                pill,
+                text="✕",
+                width=28,
+                height=28,
+                command=lambda lbl=label: self._remove_label(lbl),
+                fg_color="#991B1B",
+                hover_color="#B91C1C",
+            )
+            remove_btn.pack(side="left", padx=(0, 6), pady=4)
+
+    def get_labels(self) -> list[str]:
+        return list(self._labels)
+
+    def set_labels(self, labels: list[str]):
+        cleaned: list[str] = []
+        for label in labels or []:
+            if not label:
+                continue
+            text = str(label).strip()
+            if text and text not in cleaned:
+                cleaned.append(text)
+        self._labels = sorted(cleaned)
+        self._refresh_tokens()
+
+    def set_suggestions(self, suggestions: list[str]):
+        self._suggestions = sorted({lbl for lbl in suggestions or [] if lbl})
+        values = self._menu_values()
+        self.suggestion_menu.configure(values=values)
+        if self.suggestion_menu.get() not in values:
+            self.suggestion_menu.set(self._menu_placeholder())
 class TaskEditor(ctk.CTkToplevel):
     def __init__(
         self,
@@ -1290,15 +1780,20 @@ class TaskEditor(ctk.CTkToplevel):
         self.description_box.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(0,8))
         self.description_box.insert("1.0", task.get("description", ""))
 
+        # Labels
+        ctk.CTkLabel(container, text="Labels").grid(row=10, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.labels_editor = LabelsEditor(container, task.get("labels", []), store.get_labels())
+        self.labels_editor.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+
         # Plan checklist
         plan_label = ctk.CTkLabel(container, text="Plan checklist")
-        plan_label.grid(row=10, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        plan_label.grid(row=12, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.plan_editor = PlanEditorFrame(container, task.get("plan", []))
-        self.plan_editor.grid(row=11, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
+        self.plan_editor.grid(row=13, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
 
         # Session history (read-only)
         history_header = ctk.CTkFrame(container, fg_color="transparent")
-        history_header.grid(row=12, column=0, columnspan=2, sticky="ew")
+        history_header.grid(row=14, column=0, columnspan=2, sticky="ew")
         ctk.CTkLabel(history_header, text="Session history").pack(side="left")
         ctk.CTkButton(
             history_header,
@@ -1308,12 +1803,12 @@ class TaskEditor(ctk.CTkToplevel):
         ).pack(side="right")
 
         self.history_box = ctk.CTkTextbox(container, height=140)
-        self.history_box.grid(row=13, column=0, columnspan=2, sticky="nsew", pady=(0,8))
+        self.history_box.grid(row=15, column=0, columnspan=2, sticky="nsew", pady=(0,8))
         self.history_box.insert("1.0", self._format_sessions(task))
         make_textbox_copyable(self.history_box)
 
-        self._render_links_section(container, 14, task)
-        next_row = 16
+        self._render_links_section(container, 16, task)
+        next_row = 18
 
         # Status + Focus
         ctk.CTkLabel(container, text="Status").grid(row=next_row, column=0, sticky="w")
@@ -1334,8 +1829,8 @@ class TaskEditor(ctk.CTkToplevel):
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=1)
         container.rowconfigure(9, weight=1)
-        container.rowconfigure(11, weight=1)
         container.rowconfigure(13, weight=1)
+        container.rowconfigure(15, weight=1)
 
     def _save(self):
         updated = {
@@ -1349,6 +1844,7 @@ class TaskEditor(ctk.CTkToplevel):
             "status": self.status_menu.get(),
             "focus": bool(self.focus_var.get()),
             "description": self.description_box.get("1.0", tk.END).strip(),
+            "labels": self.labels_editor.get_labels(),
             "plan": self.plan_editor.get_plan(),
         }
         if not updated["title"]:
@@ -1455,7 +1951,9 @@ class TaskEditor(ctk.CTkToplevel):
         self.history_box.insert("1.0", self._format_sessions(latest))
         self.history_box.configure(state="disabled")
         self.plan_editor.load_plan(latest.get("plan", []))
-        self._render_links_section(self.container, 14, latest)
+        self.labels_editor.set_labels(latest.get("labels", []))
+        self.labels_editor.set_suggestions(self.store.get_labels())
+        self._render_links_section(self.container, 16, latest)
 
 
 class PlanEditorFrame(ctk.CTkFrame):
@@ -2185,6 +2683,7 @@ class TaskFocusApp(ctk.CTk):
         self.geometry("1100x750")
         self.minsize(720, 520)
         self.people_options = self.store.get_people()
+        self.label_options = self.store.get_labels()
         self.timer_window = None
         self.editor_window = None
         self._layout_mode: str | None = None
@@ -2197,6 +2696,9 @@ class TaskFocusApp(ctk.CTk):
         self._stats_dirty = True
         self._search_cache_dirty = True
         self._search_cache = {}
+        self._labels_dirty = True
+        self.selected_task_id: int | None = None
+        self._selected_card_widget: TaskCard | None = None
 
         self.bind("<Configure>", self._on_window_configure)
 
@@ -2213,6 +2715,7 @@ class TaskFocusApp(ctk.CTk):
         self.today_tab = self.tabs.add("Today's Tasks")
         self.all_tab = self.tabs.add("All Tasks")
         self.stats_tab = self.tabs.add("Statistics")
+        self.report_tab = self.tabs.add("Reports")
         self.add_tab = self.tabs.add("Add Task")
         self.bulk_tab = self.tabs.add("Bulk Import")
 
@@ -2220,6 +2723,7 @@ class TaskFocusApp(ctk.CTk):
         self._build_today_tab()
         self._build_all_tab()
         self._build_stats_tab()
+        self._build_report_tab()
         self._build_add_tab()
         self._build_bulk_tab()
 
@@ -2249,6 +2753,21 @@ class TaskFocusApp(ctk.CTk):
         if hasattr(self, "add_assignee"):
             self.add_assignee.configure(values=values)
 
+    def _refresh_label_options(self):
+        self.label_options = self.store.get_labels()
+        if hasattr(self, "add_labels_editor"):
+            self.add_labels_editor.set_suggestions(self.label_options)
+        if self.editor_window and self.editor_window.winfo_exists():
+            editor = self.editor_window
+            if hasattr(editor, "labels_editor"):
+                editor.labels_editor.set_suggestions(self.label_options)
+        if hasattr(self, "report_label_filter"):
+            values = ["All labels"] + self.label_options
+            current = self.report_label_filter.get()
+            self.report_label_filter.configure(values=values)
+            if current not in values:
+                self.report_label_filter.set("All labels")
+
     def _build_today_tab(self):
         # Top bar
         top = ctk.CTkFrame(self.today_tab)
@@ -2271,9 +2790,18 @@ class TaskFocusApp(ctk.CTk):
         )
         self.today_search_entry.pack(side="right", padx=(6, 0))
 
-        # Scrollable list
-        self.today_list = ctk.CTkScrollableFrame(self.today_tab)
-        self.today_list.pack(fill="both", expand=True)
+        # Content split: list + preview
+        today_content = ctk.CTkFrame(self.today_tab, fg_color="transparent")
+        today_content.pack(fill="both", expand=True)
+        today_content.grid_columnconfigure(0, weight=2)
+        today_content.grid_columnconfigure(1, weight=1)
+        today_content.grid_rowconfigure(0, weight=1)
+
+        self.today_list = ctk.CTkScrollableFrame(today_content)
+        self.today_list.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+
+        self.today_preview = TaskPreviewPane(today_content)
+        self.today_preview.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
 
     def _build_all_tab(self):
         # Filters bar
@@ -2301,9 +2829,17 @@ class TaskFocusApp(ctk.CTk):
         )
         self.all_search_entry.pack(side="right", padx=(6, 0))
 
-        # List
-        self.all_list = ctk.CTkScrollableFrame(self.all_tab)
-        self.all_list.pack(fill="both", expand=True)
+        all_content = ctk.CTkFrame(self.all_tab, fg_color="transparent")
+        all_content.pack(fill="both", expand=True)
+        all_content.grid_columnconfigure(0, weight=2)
+        all_content.grid_columnconfigure(1, weight=1)
+        all_content.grid_rowconfigure(0, weight=1)
+
+        self.all_list = ctk.CTkScrollableFrame(all_content)
+        self.all_list.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+
+        self.all_preview = TaskPreviewPane(all_content)
+        self.all_preview.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
 
     def _build_stats_tab(self):
         if not MATPLOTLIB_AVAILABLE:
@@ -2377,6 +2913,46 @@ class TaskFocusApp(ctk.CTk):
         self.workload_chart_holder.pack_propagate(False)
         self.workload_canvas: FigureCanvasTkAgg | None = None
 
+    def _build_report_tab(self):
+        container = ctk.CTkFrame(self.report_tab)
+        container.pack(fill="both", expand=True, padx=12, pady=12)
+
+        controls = ctk.CTkFrame(container, fg_color="transparent")
+        controls.pack(fill="x", pady=(0, 12))
+
+        controls.grid_columnconfigure(2, weight=1)
+
+        ctk.CTkLabel(controls, text="From").grid(row=0, column=0, sticky="w")
+        self.report_start = create_dark_date_entry(controls)
+        self.report_start.grid(row=1, column=0, sticky="w", padx=(0, 12))
+        self.report_start.set_date(date.today() - timedelta(days=6))
+
+        ctk.CTkLabel(controls, text="To").grid(row=0, column=1, sticky="w")
+        self.report_end = create_dark_date_entry(controls)
+        self.report_end.grid(row=1, column=1, sticky="w", padx=(0, 12))
+        self.report_end.set_date(date.today())
+
+        ctk.CTkLabel(controls, text="Label filter").grid(row=0, column=2, sticky="w")
+        self.report_label_filter = ctk.CTkOptionMenu(
+            controls,
+            values=["All labels"] + self.label_options,
+        )
+        self.report_label_filter.grid(row=1, column=2, sticky="w")
+        self.report_label_filter.set("All labels")
+
+        action_frame = ctk.CTkFrame(controls, fg_color="transparent")
+        action_frame.grid(row=1, column=3, sticky="e", padx=(12, 0))
+        ctk.CTkButton(action_frame, text="Generate", command=self._generate_report, width=120).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(action_frame, text="Copy", command=self._copy_report, width=80).pack(side="left")
+
+        self.report_status = ctk.CTkLabel(container, text="Select a range and generate a report.", text_color="#9CA3AF")
+        self.report_status.pack(anchor="w", padx=4, pady=(0, 8))
+
+        self.report_text = ctk.CTkTextbox(container, height=440)
+        self.report_text.pack(fill="both", expand=True)
+        self.report_text.insert("1.0", "Report output will appear here.")
+        make_textbox_copyable(self.report_text)
+
     def _build_add_tab(self):
         container = ctk.CTkFrame(self.add_tab)
         container.pack(fill="both", expand=True, padx=12, pady=12)
@@ -2411,6 +2987,9 @@ class TaskFocusApp(ctk.CTk):
 
         self.add_description_label = ctk.CTkLabel(container, text="Description")
         self.add_description = ctk.CTkTextbox(container, height=160)
+
+        self.add_labels_label = ctk.CTkLabel(container, text="Labels")
+        self.add_labels_editor = LabelsEditor(container, [], self.label_options)
 
         self.add_plan_label = ctk.CTkLabel(container, text="Plan checklist (optional)")
         self.add_plan_editor = PlanEditorFrame(container, [])
@@ -2473,11 +3052,13 @@ class TaskFocusApp(ctk.CTk):
                 (self.add_deadline, {"row": 13, "column": 0, "sticky": "ew", "pady": (0, 8)}),
                 (self.add_description_label, {"row": 14, "column": 0, "sticky": "w"}),
                 (self.add_description, {"row": 15, "column": 0, "sticky": "nsew", "pady": (0, 8)}),
-                (self.add_plan_label, {"row": 16, "column": 0, "sticky": "w"}),
-                (self.add_plan_editor, {"row": 17, "column": 0, "sticky": "nsew", "pady": (0, 8)}),
-                (self.add_button_row, {"row": 18, "column": 0, "sticky": "e"}),
+                (self.add_labels_label, {"row": 16, "column": 0, "sticky": "w"}),
+                (self.add_labels_editor, {"row": 17, "column": 0, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_plan_label, {"row": 18, "column": 0, "sticky": "w"}),
+                (self.add_plan_editor, {"row": 19, "column": 0, "sticky": "nsew", "pady": (0, 8)}),
+                (self.add_button_row, {"row": 20, "column": 0, "sticky": "e"}),
             ]
-            target_row = 17
+            target_row = 19
         else:
             container.grid_columnconfigure(0, weight=1)
             container.grid_columnconfigure(1, weight=1)
@@ -2498,11 +3079,13 @@ class TaskFocusApp(ctk.CTk):
                 (self.add_deadline, {"row": 7, "column": 1, "sticky": "ew", "pady": (0, 8)}),
                 (self.add_description_label, {"row": 8, "column": 0, "columnspan": 2, "sticky": "w"}),
                 (self.add_description, {"row": 9, "column": 0, "columnspan": 2, "sticky": "nsew", "pady": (0, 8)}),
-                (self.add_plan_label, {"row": 10, "column": 0, "columnspan": 2, "sticky": "w"}),
-                (self.add_plan_editor, {"row": 11, "column": 0, "columnspan": 2, "sticky": "nsew", "pady": (0, 8)}),
-                (self.add_button_row, {"row": 12, "column": 0, "columnspan": 2, "sticky": "e"}),
+                (self.add_labels_label, {"row": 10, "column": 0, "columnspan": 2, "sticky": "w"}),
+                (self.add_labels_editor, {"row": 11, "column": 0, "columnspan": 2, "sticky": "ew", "pady": (0, 8)}),
+                (self.add_plan_label, {"row": 12, "column": 0, "columnspan": 2, "sticky": "w"}),
+                (self.add_plan_editor, {"row": 13, "column": 0, "columnspan": 2, "sticky": "nsew", "pady": (0, 8)}),
+                (self.add_button_row, {"row": 14, "column": 0, "columnspan": 2, "sticky": "e"}),
             ]
-            target_row = 11
+            target_row = 13
 
         for widget, opts in placements:
             widget.grid(**opts)
@@ -2944,12 +3527,17 @@ class TaskFocusApp(ctk.CTk):
             self._search_cache_dirty = True
         if not hasattr(self, "_search_cache"):
             self._search_cache = {}
+        if not hasattr(self, "_labels_dirty"):
+            self._labels_dirty = True
+        if not hasattr(self, "label_options"):
+            self.label_options = self.store.get_labels()
 
     def refresh_all(self, data_changed: bool = False, immediate: bool = False):
         self._ensure_refresh_state()
         if data_changed:
             self._stats_dirty = True
             self._search_cache_dirty = True
+            self._labels_dirty = True
         refresh_job = getattr(self, "_refresh_job", None)
         if immediate:
             if refresh_job:
@@ -2971,12 +3559,17 @@ class TaskFocusApp(ctk.CTk):
             self._rebuild_search_cache()
             self._search_cache_dirty = False
         self._refresh_people_options()
+        if self._labels_dirty:
+            self._refresh_label_options()
+            self._labels_dirty = False
         self._refresh_today_list()
         self._refresh_all_list()
         self.status_label.configure(text=f"Tasks: {len(self.store.data['tasks'])}")
         if self._stats_dirty:
             self._refresh_stats()
             self._stats_dirty = False
+        self._sync_card_selection()
+        self._show_preview_for_task(self.selected_task_id)
 
     def _rebuild_search_cache(self):
         cache: dict[int, str] = {}
@@ -2997,6 +3590,7 @@ class TaskFocusApp(ctk.CTk):
             task.get("priority", ""),
             task.get("start_date", ""),
             task.get("deadline", ""),
+            " ".join(task.get("labels", []) or []),
         ]
         for item in task.get("plan", []) or []:
             pieces.append(item.get("text", ""))
@@ -3104,6 +3698,7 @@ class TaskFocusApp(ctk.CTk):
             ctk.CTkLabel(self.all_list, text="No tasks to show.").pack(pady=12)
 
     def _add_task_card(self, parent, task: dict):
+        is_selected = bool(self.selected_task_id and task.get("id") == self.selected_task_id)
         card = TaskCard(parent, task,
                         on_edit=self._open_editor,
                         on_done_toggle=self._toggle_done,
@@ -3111,8 +3706,53 @@ class TaskFocusApp(ctk.CTk):
                         on_start_timer=self._start_task_timer,
                         on_log_time=self._log_manual_time,
                         on_plan_toggle=self._toggle_plan_item,
-                        on_postpone=self._postpone_task)
+                        on_postpone=self._postpone_task,
+                        on_select=self._on_task_card_selected,
+                        selected=is_selected)
         card.pack(fill="x", padx=12, pady=10)
+        if is_selected:
+            self._selected_card_widget = card
+
+    def _on_task_card_selected(self, card: TaskCard, _event=None):
+        if not isinstance(card, TaskCard):
+            return
+        task_id = card.task.get("id")
+        if not task_id:
+            return
+        self.selected_task_id = task_id
+        self._selected_card_widget = card
+        self._sync_card_selection()
+        self._show_preview_for_task(task_id)
+
+    def _sync_card_selection(self):
+        selected_id = self.selected_task_id
+        found = False
+        for container in (getattr(self, "today_list", None), getattr(self, "all_list", None)):
+            if container is None:
+                continue
+            for child in container.winfo_children():
+                if isinstance(child, TaskCard):
+                    is_selected = bool(selected_id and child.task.get("id") == selected_id)
+                    child.set_selected(is_selected)
+                    if is_selected:
+                        self._selected_card_widget = child
+                        found = True
+        if not found and selected_id:
+            self.selected_task_id = None
+
+    def _show_preview_for_task(self, task_id: int | None):
+        task = self.store.get_task(task_id) if task_id else None
+        if not task:
+            self.selected_task_id = None
+            if hasattr(self, "today_preview"):
+                self.today_preview.show_task(None)
+            if hasattr(self, "all_preview"):
+                self.all_preview.show_task(None)
+            return
+        if hasattr(self, "today_preview"):
+            self.today_preview.show_task(task)
+        if hasattr(self, "all_preview"):
+            self.all_preview.show_task(task)
 
     def _toggle_done(self, task):
         new_status = "open" if task.get("status") == "done" else "done"
@@ -3260,6 +3900,7 @@ class TaskFocusApp(ctk.CTk):
         self.add_start.set_date(date.today())
         self.add_deadline.set_date(date.today())
         self.add_description.delete("1.0", tk.END)
+        self.add_labels_editor.set_labels([])
         self.add_plan_editor.load_plan([])
 
     def _add_task_from_form(self):
@@ -3278,6 +3919,7 @@ class TaskFocusApp(ctk.CTk):
             "status": "open",
             "focus": False,
             "description": self.add_description.get("1.0", tk.END).strip(),
+            "labels": self.add_labels_editor.get_labels(),
             "plan": self.add_plan_editor.get_plan(),
         }
         self.store.add_task(task)
@@ -3388,109 +4030,113 @@ class TaskFocusApp(ctk.CTk):
         except Exception:
             self.bulk_status.configure(text="Unable to copy instructions.")
 
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
+    def _set_report_text(self, text: str):
+        if not hasattr(self, "report_text"):
+            return
+        self.report_text.configure(state="normal")
+        self.report_text.delete("1.0", tk.END)
+        self.report_text.insert("1.0", text)
+        self.report_text.configure(state="disabled")
 
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
+    def _generate_report(self):
+        if not hasattr(self, "report_start"):
+            return
+        start_date = self.report_start.get_date()
+        end_date = self.report_end.get_date()
+        if start_date > end_date:
+            self.report_status.configure(text="Start date must be on or before the end date.")
+            self._set_report_text("")
+            return
+        label_value = self.report_label_filter.get() if hasattr(self, "report_label_filter") else "All labels"
+        label_filter = None if label_value in (None, "All labels") else label_value
 
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
+        results: list[tuple[dict, list[tuple[datetime, dict]], int]] = []
+        for task in self.store.data.get("tasks", []):
+            if label_filter and label_filter not in (task.get("labels") or []):
+                continue
+            session_pairs: list[tuple[datetime, dict]] = []
+            total_minutes = 0
+            for session in task.get("sessions", []) or []:
+                ts = parse_session_timestamp(session.get("timestamp"))
+                if not ts:
+                    continue
+                if ts.date() < start_date or ts.date() > end_date:
+                    continue
+                session_pairs.append((ts, session))
+                try:
+                    total_minutes += max(0, int(session.get("minutes", 0) or 0))
+                except Exception:
+                    continue
+            if not session_pairs:
+                continue
+            session_pairs.sort(key=lambda pair: pair[0])
+            results.append((task, session_pairs, total_minutes))
 
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
+        if not results:
+            self._set_report_text("No sessions recorded in this period.")
+            self.report_status.configure(text="No sessions matched the selected filters.")
+            return
 
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
+        results.sort(key=lambda item: item[2], reverse=True)
+        total_minutes_all = 0
+        lines: list[str] = []
+        header = f"Task report {start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}"
+        if label_filter:
+            header += f" (label: {label_filter})"
+        lines.append(header)
+        lines.append("")
 
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
+        for idx, (task, session_pairs, minutes_spent) in enumerate(results, 1):
+            title = task.get("title", "Task")
+            lines.append(f"{idx}. {title} (ID {task.get('id')})")
+            meta_line = f"   Type: {task.get('type', '—')} | Priority: {task.get('priority', '—')} | Assignee: {task.get('assignee') or '—'}"
+            lines.append(meta_line)
+            for ts, session in session_pairs:
+                ts_text = ts.strftime("%Y-%m-%d %H:%M") if isinstance(ts, datetime) else session.get("timestamp", "?")
+                minutes = max(0, int(session.get("minutes", 0) or 0))
+                entry = f"   - {ts_text} — {minutes} min"
+                note = session.get("note", "")
+                if note:
+                    entry += f": {note}"
+                plan_ids = session.get("plan_items") or []
+                if plan_ids:
+                    related = [
+                        item.get("text", "")
+                        for item in task.get("plan", [])
+                        if item.get("id") in plan_ids and item.get("text")
+                    ]
+                    if related:
+                        entry += f" [Plan: {', '.join(related)}]"
+                lines.append(entry)
+            lines.append(f"   Total for period: {format_minutes(minutes_spent)} ({minutes_spent} min)")
+            links = gather_task_links(task)
+            if links:
+                lines.append("   Links:")
+                for url in links:
+                    lines.append(f"     - {url}")
+            lines.append("")
+            total_minutes_all += minutes_spent
 
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
+        lines.append(f"Overall time: {format_minutes(total_minutes_all)} across {len(results)} task(s)")
+        report_text = "\n".join(lines).strip()
+        self._set_report_text(report_text)
+        self.report_status.configure(text=f"Report generated for {len(results)} task(s).")
 
-    def _copy_bulk_instructions(self):
+    def _copy_report(self):
+        if not hasattr(self, "report_text"):
+            return
         try:
+            self.report_text.configure(state="normal")
+            content = self.report_text.get("1.0", "end-1c").strip()
+            self.report_text.configure(state="disabled")
+            if not content:
+                self.report_status.configure(text="Nothing to copy.")
+                return
             self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
+            self.clipboard_append(content)
+            self.report_status.configure(text="Report copied to clipboard.")
         except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
-
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
-
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
-
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
-
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
-
-    def _copy_bulk_instructions(self):
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(self.bulk_instruction_text)
-            self.bulk_status.configure(text="Instructions copied.")
-        except Exception:
-            self.bulk_status.configure(text="Unable to copy instructions.")
+            self.report_status.configure(text="Unable to copy report.")
 
     def _prompt_focus_selection(self):
         tasks = self.store.eligible_today()
