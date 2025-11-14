@@ -58,116 +58,6 @@ except ImportError:
     plt = None
     FigureCanvasTkAgg = None
 
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib import pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
-    FigureCanvasTkAgg = None
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib import pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
-    FigureCanvasTkAgg = None
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib import pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
-    FigureCanvasTkAgg = None
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib import pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
-    FigureCanvasTkAgg = None
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib import pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
-    FigureCanvasTkAgg = None
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib import pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
-    FigureCanvasTkAgg = None
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib import pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
-    FigureCanvasTkAgg = None
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib import pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
-    FigureCanvasTkAgg = None
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib import pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
-    FigureCanvasTkAgg = None
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib import pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
-    FigureCanvasTkAgg = None
-
 # -------------------------------
 # CONFIG
 # -------------------------------
@@ -547,6 +437,13 @@ class TaskStore:
             "tasks": [],
             "meta": {"last_focus_date": None, "people": [], "labels": []},
         }
+        # Keep a direct lookup of task id -> task dict so high-frequency
+        # operations (toggling focus, logging sessions, refreshing previews)
+        # do not require scanning the entire task list each time. The index is
+        # rebuilt whenever tasks are reloaded from disk and kept in sync for all
+        # mutations, which noticeably improves responsiveness when hundreds of
+        # tasks exist.
+        self._task_index: dict[int, dict] = {}
         self.load()
 
     def load(self):
@@ -568,10 +465,12 @@ class TaskStore:
                 self._ensure_task_defaults(task)
                 self.register_people(task.get("who_asked"), task.get("assignee"))
                 self.register_labels(*(task.get("labels") or []))
+            self._rebuild_index()
         except Exception:
             # Create fresh if corrupted
             self.data = {"tasks": [], "meta": {"last_focus_date": None, "people": []}}
             self.save()
+            self._rebuild_index()
 
     def save(self):
         ensure_dirs()
@@ -642,6 +541,21 @@ class TaskStore:
         except Exception:
             total = 0
         task["time_spent_minutes"] = max(total, 0)
+
+    def _index_task(self, task: dict | None) -> None:
+        if not task:
+            return
+        try:
+            tid = int(task.get("id"))
+        except Exception:
+            return
+        if tid:
+            self._task_index[tid] = task
+
+    def _rebuild_index(self) -> None:
+        self._task_index = {}
+        for task in self.data.get("tasks", []):
+            self._index_task(task)
 
     def _sync_plan_completion(
         self,
@@ -733,7 +647,9 @@ class TaskStore:
         task.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
         task.setdefault("completed_at", None)
         task["labels"] = self._normalize_labels(task.get("labels"))
-        self.data["tasks"].append(self._ensure_task_defaults(task))
+        task = self._ensure_task_defaults(task)
+        self.data["tasks"].append(task)
+        self._index_task(task)
         self.register_people(task.get("who_asked"), task.get("assignee"))
         self.register_labels(*(task.get("labels") or []))
         self.save()
@@ -741,48 +657,50 @@ class TaskStore:
 
     def update_task(self, task_id: int, updates: dict):
         updates = dict(updates or {})
-        for t in self.data["tasks"]:
-            if t.get("id") == task_id:
-                plan_updates = updates.pop("plan", None)
-                if "labels" in updates:
-                    updates["labels"] = self._normalize_labels(updates["labels"])
-                t.update(updates)
-                if plan_updates is not None:
-                    self._merge_plan_items(t, plan_updates)
-                self._ensure_task_defaults(t)
-                self.register_people(t.get("who_asked"), t.get("assignee"))
-                self.register_labels(*(t.get("labels") or []))
-                self.save()
-                return t
-        return None
+        task = self._task_index.get(task_id)
+        if not task:
+            return None
+        plan_updates = updates.pop("plan", None)
+        if "labels" in updates:
+            updates["labels"] = self._normalize_labels(updates["labels"])
+        task.update(updates)
+        if plan_updates is not None:
+            self._merge_plan_items(task, plan_updates)
+        self._ensure_task_defaults(task)
+        self.register_people(task.get("who_asked"), task.get("assignee"))
+        self.register_labels(*(task.get("labels") or []))
+        self._index_task(task)
+        self.save()
+        return task
 
     def set_plan_completion(self, task_id: int, item_id: str, completed: bool):
-        for t in self.data["tasks"]:
-            if t.get("id") != task_id:
+        task = self._task_index.get(task_id)
+        if not task:
+            return None
+        self._ensure_task_defaults(task)
+        for item in task.get("plan", []):
+            if item.get("id") != item_id:
                 continue
-            self._ensure_task_defaults(t)
-            for item in t.get("plan", []):
-                if item.get("id") != item_id:
-                    continue
-                item["completed"] = bool(completed)
-                if completed:
-                    item["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                else:
-                    item["completed_at"] = None
-                item["completed_by"] = None
-                self.save()
-                return item
+            item["completed"] = bool(completed)
+            if completed:
+                item["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            else:
+                item["completed_at"] = None
+            item["completed_by"] = None
+            self.save()
+            return item
         return None
 
     def delete_task(self, task_id: int):
         self.data["tasks"] = [t for t in self.data["tasks"] if t.get("id") != task_id]
+        self._task_index.pop(task_id, None)
         self.save()
 
     def get_task(self, task_id: int) -> dict | None:
-        for t in self.data.get("tasks", []):
-            if t.get("id") == task_id:
-                return self._ensure_task_defaults(t)
-        return None
+        task = self._task_index.get(task_id)
+        if not task:
+            return None
+        return self._ensure_task_defaults(task)
 
     def list_tasks(self, status: str | None = None):
         tasks = list(self.data["tasks"])
@@ -831,23 +749,23 @@ class TaskStore:
         timestamp: str | None = None,
         plan_item_ids: list[str] | None = None,
     ):
-        for t in self.data.get("tasks", []):
-            if t.get("id") == task_id:
-                self._ensure_task_defaults(t)
-                ts = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M")
-                session_entry = {
-                    "id": uuid.uuid4().hex,
-                    "timestamp": ts,
-                    "minutes": int(minutes),
-                    "note": note,
-                    "plan_items": list(plan_item_ids or []),
-                }
-                t["sessions"].append(session_entry)
-                self._sync_plan_completion(t, session_entry["id"], session_entry.get("plan_items"), ts)
-                self._recalculate_time_spent(t)
-                self.save()
-                return session_entry
-        return None
+        task = self._task_index.get(task_id)
+        if not task:
+            return None
+        self._ensure_task_defaults(task)
+        ts = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M")
+        session_entry = {
+            "id": uuid.uuid4().hex,
+            "timestamp": ts,
+            "minutes": int(minutes),
+            "note": note,
+            "plan_items": list(plan_item_ids or []),
+        }
+        task["sessions"].append(session_entry)
+        self._sync_plan_completion(task, session_entry["id"], session_entry.get("plan_items"), ts)
+        self._recalculate_time_spent(task)
+        self.save()
+        return session_entry
 
     def update_session(
         self,
@@ -859,21 +777,21 @@ class TaskStore:
         note: str,
         plan_item_ids: list[str] | None = None,
     ) -> dict | None:
-        for t in self.data.get("tasks", []):
-            if t.get("id") != task_id:
+        task = self._task_index.get(task_id)
+        if not task:
+            return None
+        self._ensure_task_defaults(task)
+        for session in task.get("sessions", []):
+            if session.get("id") != session_id:
                 continue
-            self._ensure_task_defaults(t)
-            for session in t.get("sessions", []):
-                if session.get("id") != session_id:
-                    continue
-                session["timestamp"] = timestamp
-                session["minutes"] = int(minutes)
-                session["note"] = note
-                session["plan_items"] = list(plan_item_ids or [])
-                self._sync_plan_completion(t, session_id, session.get("plan_items"), timestamp)
-                self._recalculate_time_spent(t)
-                self.save()
-                return session
+            session["timestamp"] = timestamp
+            session["minutes"] = int(minutes)
+            session["note"] = note
+            session["plan_items"] = list(plan_item_ids or [])
+            self._sync_plan_completion(task, session_id, session.get("plan_items"), timestamp)
+            self._recalculate_time_spent(task)
+            self.save()
+            return session
         return None
 
     def eligible_today(self):
@@ -910,406 +828,110 @@ class TaskCard(ctk.CTkFrame):
         self,
         master,
         task: dict,
-        on_edit,
-        on_done_toggle,
-        on_focus_toggle,
-        on_start_timer,
-        on_log_time,
-        on_plan_toggle,
-        on_postpone,
-        on_select=None,
         *,
+        on_select=None,
         selected: bool = False,
     ):
         super().__init__(master)
         self.task = task
-        self.on_edit = on_edit
-        self.on_done_toggle = on_done_toggle
-        self.on_focus_toggle = on_focus_toggle
-        self.on_start_timer = on_start_timer
-        self.on_log_time = on_log_time
-        self.on_plan_toggle = on_plan_toggle
-        self.on_postpone = on_postpone
         self.on_select = on_select
-        self._layout_mode: str | None = None
-        self.plan_checks: dict[str, dict[str, object]] = {}
         self._selected = bool(selected)
-        self._default_border_color = "#312E81"
-        self._selected_border_color = "#6366F1"
+        self._default_border_color = "#1E1B4B"
+        self._selected_border_color = "#7C3AED"
 
         self.configure(
             fg_color="#0F172A",
-            corner_radius=18,
+            corner_radius=16,
             border_width=1,
             border_color=self._default_border_color,
         )
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=1)
 
-        # Left labels container
-        self.left_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.left_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=(20, 8))
+        container = ctk.CTkFrame(self, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=18, pady=16)
 
-        title_row = ctk.CTkFrame(self.left_frame, fg_color="transparent")
-        title_row.pack(anchor="w", fill="x")
-
-        focus_prefix = "⭐ " if task.get("focus") else ""
+        header = ctk.CTkFrame(container, fg_color="transparent")
+        header.pack(fill="x")
         self.title_label = ctk.CTkLabel(
-            title_row,
-            text=f"{focus_prefix}{task.get('title','(no title)')}",
-            font=("Segoe UI", 16, "bold"),
+            header,
+            text=task.get("title", "(no title)"),
+            font=("Segoe UI", 15, "bold"),
+            anchor="w",
             justify="left",
+        )
+        self.title_label.pack(side="left", fill="x", expand=True)
+
+        status = task.get("status", "open")
+        self.status_badge = ctk.CTkLabel(
+            header,
+            text=status.capitalize(),
+            font=("Segoe UI", 12),
+            fg_color="#22C55E" if status == "done" else "#312E81",
+            text_color="#0B1120" if status == "done" else "#F9FAFB",
+            corner_radius=8,
+            padx=8,
+            pady=2,
+        )
+        self.status_badge.pack(side="right")
+
+        meta = ctk.CTkFrame(container, fg_color="transparent")
+        meta.pack(fill="x", pady=(10, 0))
+
+        self._add_meta_row(meta, "Type", task.get("type") or "—", column=0, row=0)
+        self._add_meta_row(meta, "Priority", task.get("priority") or "—", column=1, row=0)
+        self._add_meta_row(meta, "Start", task.get("start_date") or "—", column=0, row=1)
+        deadline = task.get("deadline") or "—"
+        overdue = False
+        dl_date = parse_date(task.get("deadline", ""))
+        if task.get("status") == "open" and dl_date and dl_date < date.today():
+            overdue = True
+        self._add_meta_row(
+            meta,
+            "Deadline",
+            deadline,
+            column=1,
+            row=1,
+            text_color="#F87171" if overdue else "#F9FAFB",
+        )
+        who = task.get("who_asked") or "—"
+        assignee = task.get("assignee") or "—"
+        self._add_meta_row(meta, "Asked by", who, column=0, row=2)
+        self._add_meta_row(meta, "Assignee", assignee, column=1, row=2)
+
+        focus = "⭐ Focus" if task.get("focus") else "☆ Not focused"
+        focus_color = "#FACC15" if task.get("focus") else "#94A3B8"
+        self.focus_label = ctk.CTkLabel(
+            container,
+            text=focus,
+            text_color=focus_color,
+            font=("Segoe UI", 12, "bold"),
             anchor="w",
         )
-        self.title_label.pack(side="left", padx=(0, 6))
+        self.focus_label.pack(fill="x", pady=(12, 0))
 
-        # Priority badge
-        pr = task.get("priority", "Medium")
-        pr_color = {
-            "High": "#F97316",  # orange
-            "Medium": "#A78BFA",  # purple-light
-            "Low": "#64748B",    # slate
-        }.get(pr, "#A78BFA")
-        pr_badge = ctk.CTkLabel(
-            title_row,
-            text=f" {pr} ",
-            fg_color=pr_color,
-            text_color="#000000",
-            corner_radius=8,
-        )
-        pr_badge.pack(side="left", pady=2)
-
-        # Meta line
-        meta = []
-        ttype = task.get("type")
-        if ttype:
-            meta.append(f"Type: {ttype}")
-        who = task.get("who_asked")
-        if who:
-            meta.append(f"Asked by: {who}")
-        assignee = task.get("assignee")
-        if assignee:
-            meta.append(f"Assignee: {assignee}")
-        minutes = int(task.get("time_spent_minutes", 0) or 0)
-        if minutes:
-            hours, mins = divmod(minutes, 60)
-            if hours:
-                time_text = f"{hours}h {mins}m" if mins else f"{hours}h"
-            else:
-                time_text = f"{mins}m"
-            meta.append(f"Time spent: {time_text}")
-        sd = task.get("start_date") or "—"
-        dl = task.get("deadline") or "—"
-        overdue = False
-        if task.get("status") == "open" and parse_date(task.get("deadline", "")):
-            if parse_date(task.get("deadline")) < date.today():
-                overdue = True
-        dl_text = f"Due: {dl}"
-        if overdue:
-            dl_text += "  (OVERDUE)"
-        top_line = " | ".join(meta)
-        if top_line:
-            meta_text = f"{top_line}\nStart: {sd} | {dl_text}"
-        else:
-            meta_text = f"Start: {sd} | {dl_text}"
-        self.meta_line = ctk.CTkLabel(self.left_frame, text=meta_text, justify="left", anchor="w")
-        self.meta_line.pack(anchor="w", pady=(6, 0))
-
-        labels = [lbl for lbl in (task.get("labels") or []) if lbl]
-        self.labels_frame: ctk.CTkFrame | None = None
-        if labels:
-            labels_container = ctk.CTkFrame(self.left_frame, fg_color="transparent")
-            labels_container.pack(anchor="w", pady=(6, 0), fill="x")
-            ctk.CTkLabel(
-                labels_container,
-                text="Labels:",
-                font=("Segoe UI", 12, "bold"),
-                text_color="#A5B4FC",
-            ).pack(side="left", padx=(0, 6))
-            self.labels_frame = ctk.CTkFrame(labels_container, fg_color="transparent")
-            self.labels_frame.pack(side="left", fill="x", expand=True)
-            for label in labels:
-                pill = ctk.CTkFrame(
-                    self.labels_frame,
-                    fg_color="#1D4ED8",
-                    corner_radius=12,
-                )
-                pill.pack(side="left", padx=2, pady=2)
-                ctk.CTkLabel(
-                    pill,
-                    text=label,
-                    font=("Segoe UI", 12),
-                    text_color="#E0E7FF",
-                ).pack(padx=8, pady=(2, 3))
-
-        desc_text = (task.get("description") or "").strip()
-        self.desc_box: ctk.CTkTextbox | None = None
-        if desc_text:
-            height = self._estimate_text_height(desc_text)
-            self.desc_label = ctk.CTkLabel(
-                self.left_frame,
-                text="Description",
-                anchor="w",
-                justify="left",
-                font=("Segoe UI", 13, "bold"),
-            )
-            self.desc_label.pack(anchor="w", pady=(8, 2))
-            self.desc_box = ctk.CTkTextbox(self.left_frame, height=height)
-            self.desc_box.pack(fill="x")
-            self.desc_box.insert("1.0", desc_text)
-            make_textbox_copyable(self.desc_box)
-
-        plan_items = [item for item in task.get("plan", []) if item.get("text")]
-        if plan_items:
-            plan_label = ctk.CTkLabel(
-                self.left_frame,
-                text="Plan",
-                anchor="w",
-                justify="left",
-                font=("Segoe UI", 13, "bold"),
-            )
-            plan_label.pack(anchor="w", pady=(8, 2))
-            plan_frame = ctk.CTkFrame(
-                self.left_frame,
-                fg_color="#111827",
-                corner_radius=12,
-                border_width=1,
-                border_color="#1E293B",
-            )
-            plan_frame.pack(fill="x", pady=(0, 4))
-            for item in plan_items:
-                item_id = item.get("id") or uuid.uuid4().hex
-                if not item.get("id"):
-                    item["id"] = item_id
-                var = tk.BooleanVar(value=bool(item.get("completed")))
-                row = ctk.CTkFrame(plan_frame, fg_color="transparent")
-                row.pack(fill="x", padx=10, pady=4)
-                checkbox = ctk.CTkCheckBox(
-                    row,
-                    text="",
-                    width=28,
-                    variable=var,
-                    command=lambda iid=item_id, v=var: self._on_plan_checkbox(iid, v),
-                )
-                checkbox.pack(side="left", padx=(4, 8))
-                label = ctk.CTkLabel(
-                    row,
-                    text=item.get("text", ""),
-                    anchor="w",
-                    justify="left",
-                    wraplength=520,
-                )
-                label.pack(side="left", fill="x", expand=True)
-                label.bind(
-                    "<Button-1>",
-                    lambda _e, iid=item_id, v=var: self._toggle_plan_from_label(iid, v),
-                )
-                label.configure(cursor="hand2")
-                self.plan_checks[item_id] = {"checkbox": checkbox, "var": var, "label": label}
-                self._style_plan_checkbox(item_id)
-
-        self.links = gather_task_links(task)
-        self.links_frame: ctk.CTkFrame | None = None
-        if self.links:
-            self.links_label = ctk.CTkLabel(
-                self.left_frame,
-                text=f"Links ({len(self.links)})",
-                anchor="w",
-                justify="left",
-            )
-            self.links_label.pack(anchor="w", pady=(8, 2))
-            self.links_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
-            self.links_frame.pack(fill="x", pady=(0, 4))
-            for url in self.links:
-                btn = ctk.CTkButton(
-                    self.links_frame,
-                    text=f"🔗 {shorten_url_display(url)}",
-                    command=lambda url=url: self._open_link(url),
-                    height=32,
-                    width=0,
-                    fg_color="#1E3A8A",
-                    hover_color="#1D4ED8",
-                    text_color="#E0E7FF",
-                    font=("Segoe UI", 13),
-                    cursor="hand2",
-                )
-                btn.pack(fill="x", pady=2)
-
-        # Divider + buttons row
-        self.separator = ctk.CTkFrame(self, fg_color="#1F2937", height=2)
-        self.separator.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 2))
-        self.separator.grid_propagate(False)
-
-        self.btns_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.btns_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(4, 18))
-
-        focus_active = bool(task.get("focus"))
-        focus_icon = "★" if focus_active else "☆"
-        self.focus_btn = self._make_button(
-            focus_icon,
-            lambda: self.on_focus_toggle(task),
-            width=44,
-        )
-        if focus_active:
-            self.focus_btn.configure(
-                fg_color="#3730A3",
-                hover_color="#312E81",
-                text_color="#FACC15",
-            )
-        else:
-            self.focus_btn.configure(
-                fg_color="#FACC15",
-                hover_color="#EAB308",
-                text_color="#111827",
-            )
-
-        self.timer_btn = self._make_button(
-            "Start work",
-            lambda: self.on_start_timer(task),
-            width=92,
-        )
-        self.log_btn = self._make_button(
-            "Log time",
-            lambda: self.on_log_time(task),
-            width=84,
-        )
-        self.postpone_btn = self._make_button(
-            "Postpone",
-            lambda: self.on_postpone(task),
-            width=92,
-            fg_color="#1F2937",
-            hover_color="#374151",
-        )
-        self.edit_btn = self._make_button(
-            "Edit",
-            lambda: self.on_edit(task),
-            width=68,
-            fg_color="#374151",
-            hover_color="#4B5563",
-        )
-
-        done_active = task.get("status") == "done"
-        done_text = "Reopen" if done_active else "Done"
-        done_fg = "#4B5563" if done_active else "#22C55E"
-        done_hover = "#6B7280" if done_active else "#16A34A"
-        self.done_btn = self._make_button(
-            done_text,
-            lambda: self.on_done_toggle(task),
-            width=84,
-            fg_color=done_fg,
-            hover_color=done_hover,
-        )
-
-        if not done_active:
-            self.done_btn.configure(text_color="#0B1120")
-
-        self._buttons = [
-            self.focus_btn,
-            self.timer_btn,
-            self.log_btn,
-            self.postpone_btn,
-            self.edit_btn,
-            self.done_btn,
-        ]
-        self._arrange_buttons("inline")
-
-        self.bind("<Configure>", self._on_configure)
         self.bind("<Button-1>", self._handle_click, add="+")
-        self.left_frame.bind("<Button-1>", self._handle_click, add="+")
-        self.btns_frame.bind("<Button-1>", self._handle_click, add="+")
+        container.bind("<Button-1>", self._handle_click, add="+")
+        meta.bind("<Button-1>", self._handle_click, add="+")
         self.set_selected(self._selected)
 
-    def _open_link(self, url: str):
-        webbrowser.open(url)
-
-    def _estimate_text_height(self, text: str) -> int:
-        lines = text.count("\n") + 1
-        approx = max((len(text) + 79) // 80, 1)
-        total_lines = max(lines, approx)
-        total_lines = max(1, min(3, total_lines))
-        return max(40, total_lines * 24)
-
-    def _make_button(
+    def _add_meta_row(
         self,
-        text: str,
-        command,
+        parent,
+        label: str,
+        value: str,
         *,
-        width: int,
-        fg_color: str = "#4C1D95",
-        hover_color: str = "#5B21B6",
+        column: int,
+        row: int,
         text_color: str = "#F9FAFB",
-    ) -> ctk.CTkButton:
-        return ctk.CTkButton(
-            self.btns_frame,
-            text=text,
-            command=command,
-            width=width,
-            height=32,
-            fg_color=fg_color,
-            hover_color=hover_color,
-            text_color=text_color,
-            font=("Segoe UI", 12),
-            corner_radius=6,
-        )
+    ) -> None:
+        wrapper = ctk.CTkFrame(parent, fg_color="transparent")
+        wrapper.grid(row=row, column=column, sticky="ew", padx=(0, 12), pady=4)
+        parent.grid_columnconfigure(column, weight=1)
+        ctk.CTkLabel(wrapper, text=label, text_color="#9CA3AF", anchor="w").pack(anchor="w")
+        ctk.CTkLabel(wrapper, text=value or "—", text_color=text_color, anchor="w").pack(anchor="w")
 
-    def _arrange_buttons(self, mode: str):
-        for btn in self._buttons:
-            btn.pack_forget()
-        if mode == "stacked":
-            for btn in self._buttons:
-                btn.pack(fill="x", padx=4, pady=4)
-        else:
-            for btn in self._buttons:
-                btn.pack(side="left", padx=4)
-        self._layout_mode = mode
-
-    def _on_configure(self, _event=None):
-        width = max(self.winfo_width(), 1)
-        wrap = max(width - 120, 260)
-        self.title_label.configure(wraplength=wrap)
-        self.meta_line.configure(wraplength=wrap)
-        for data in self.plan_checks.values():
-            data["label"].configure(wraplength=max(wrap - 60, 200))
-
-        mode = "stacked" if width < 860 else "inline"
-        if mode != self._layout_mode:
-            self._arrange_buttons(mode)
-
-    def _style_plan_checkbox(self, item_id: str) -> None:
-        record = self.plan_checks.get(item_id)
-        if not record:
-            return
-        checkbox = record["checkbox"]
-        var = record["var"]
-        label = record["label"]
-        checked = bool(var.get())
-        accent = "#34D399" if checked else "#E5E7EB"
-        checkbox.configure(fg_color="#34D399" if checked else "#1F2937")
-        checkbox.configure(hover_color="#059669" if checked else "#334155")
-        checkbox.configure(border_color="#34D399" if checked else "#475569")
-        label.configure(text_color=accent)
-
-    def _on_plan_checkbox(self, item_id: str, var: tk.BooleanVar) -> None:
-        checked = bool(var.get())
-        success = True
-        if callable(getattr(self, "on_plan_toggle", None)):
-            success = self.on_plan_toggle(self.task, item_id, checked)
-        if success is False:
-            var.set(not checked)
-        else:
-            for item in self.task.get("plan", []) or []:
-                if item.get("id") == item_id:
-                    item["completed"] = bool(var.get())
-                    break
-        self._style_plan_checkbox(item_id)
-
-    def _toggle_plan_from_label(self, item_id: str, var: tk.BooleanVar) -> None:
-        var.set(not bool(var.get()))
-        self._on_plan_checkbox(item_id, var)
-
-    def _handle_click(self, event):
+    def _handle_click(self, _event):
         if callable(self.on_select):
-            self.on_select(self, event)
+            self.on_select(self)
 
     def set_selected(self, selected: bool) -> None:
         self._selected = bool(selected)
@@ -1317,8 +939,22 @@ class TaskCard(ctk.CTkFrame):
         self.configure(border_color=border)
 
 
-class TaskPreviewPane(ctk.CTkFrame):
-    def __init__(self, master):
+class TaskDetailPane(ctk.CTkFrame):
+    def __init__(
+        self,
+        master,
+        *,
+        on_toggle_done,
+        on_toggle_focus,
+        on_start_timer,
+        on_log_time,
+        on_postpone,
+        on_plan_toggle,
+        on_manage_sessions,
+        on_save,
+        people_options: list[str],
+        label_options: list[str],
+    ):
         super().__init__(
             master,
             fg_color="#0B1220",
@@ -1326,107 +962,193 @@ class TaskPreviewPane(ctk.CTkFrame):
             border_width=1,
             border_color="#1E293B",
         )
-        self.grid_propagate(False)
+        self.on_toggle_done = on_toggle_done
+        self.on_toggle_focus = on_toggle_focus
+        self.on_start_timer = on_start_timer
+        self.on_log_time = on_log_time
+        self.on_postpone = on_postpone
+        self.on_plan_toggle = on_plan_toggle
+        self.on_manage_sessions = on_manage_sessions
+        self.on_save = on_save
+        self._people_options = list(people_options)
+        self._label_options = list(label_options)
+        self.current_task: dict | None = None
+        self.mode = "empty"
+        self.plan_rows: dict[str, dict[str, object]] = {}
+        self.editor_form: TaskEditorForm | None = None
 
         self.placeholder = ctk.CTkLabel(
             self,
-            text="Select a task to see the full description, sessions, and links.",
+            text="Select a task from the list to see its full details.",
+            font=("Segoe UI", 14),
             text_color="#94A3B8",
-            justify="center",
-            wraplength=320,
+            justify="left",
         )
-        self.placeholder.pack(expand=True, padx=16, pady=16)
+        self.placeholder.pack(expand=True, padx=18, pady=18)
 
         self.content = ctk.CTkFrame(self, fg_color="transparent")
-        self.content.grid_columnconfigure(0, weight=1)
+        self._build_view()
+        self._build_edit()
+        self._show_placeholder()
 
+    def _build_view(self):
+        self.view_frame = ctk.CTkFrame(self.content, fg_color="transparent")
+
+        header = ctk.CTkFrame(self.view_frame, fg_color="transparent")
+        header.pack(fill="x", padx=18, pady=(18, 8))
         self.title_label = ctk.CTkLabel(
-            self.content,
+            header,
             text="",
             font=("Segoe UI", 18, "bold"),
-            justify="left",
             anchor="w",
+            justify="left",
         )
-        self.title_label.pack(anchor="w", padx=16, pady=(16, 4))
+        self.title_label.pack(side="left", fill="x", expand=True)
+
+        self.edit_btn = ctk.CTkButton(
+            header,
+            text="Edit task",
+            width=110,
+            command=self._enter_edit_mode,
+        )
+        self.edit_btn.pack(side="right")
 
         self.meta_label = ctk.CTkLabel(
-            self.content,
+            self.view_frame,
             text="",
             justify="left",
             anchor="w",
+            font=("Segoe UI", 12),
         )
-        self.meta_label.pack(anchor="w", padx=16)
+        self.meta_label.pack(fill="x", padx=18)
 
-        self.labels_holder = ctk.CTkFrame(self.content, fg_color="transparent")
-        self.labels_holder.pack(anchor="w", padx=16, pady=(8, 0))
+        self.time_label = ctk.CTkLabel(
+            self.view_frame,
+            text="",
+            anchor="w",
+            text_color="#C7D2FE",
+        )
+        self.time_label.pack(fill="x", padx=18, pady=(0, 4))
 
-        self.description_label = ctk.CTkLabel(
-            self.content,
+        self.labels_holder = ctk.CTkFrame(self.view_frame, fg_color="transparent")
+        self.labels_holder.pack(fill="x", padx=18, pady=(4, 8))
+
+        self.action_bar = ctk.CTkFrame(self.view_frame, fg_color="transparent")
+        self.action_bar.pack(fill="x", padx=18, pady=(4, 8))
+        self.focus_btn = ctk.CTkButton(self.action_bar, text="Add focus", width=90, command=self._toggle_focus)
+        self.timer_btn = ctk.CTkButton(self.action_bar, text="Start work", width=110, command=self._start_timer)
+        self.log_btn = ctk.CTkButton(self.action_bar, text="Log time", width=90, command=self._log_time)
+        self.postpone_btn = ctk.CTkButton(self.action_bar, text="Postpone", width=100, command=self._postpone)
+        self.done_btn = ctk.CTkButton(self.action_bar, text="Mark done", width=110, command=self._toggle_done)
+        for widget in (self.focus_btn, self.timer_btn, self.log_btn, self.postpone_btn, self.done_btn):
+            widget.pack(side="left", padx=4)
+
+        desc_label = ctk.CTkLabel(
+            self.view_frame,
             text="Description",
             font=("Segoe UI", 13, "bold"),
             anchor="w",
         )
-        self.description_label.pack(anchor="w", padx=16, pady=(12, 4))
-
-        self.description_text = ctk.CTkTextbox(self.content, height=150)
-        self.description_text.pack(fill="x", padx=16)
-        self.description_text.insert("1.0", "")
+        desc_label.pack(fill="x", padx=18, pady=(8, 0))
+        self.description_text = ctk.CTkTextbox(self.view_frame, height=200)
+        self.description_text.pack(fill="both", expand=False, padx=18)
         make_textbox_copyable(self.description_text)
 
         self.plan_label = ctk.CTkLabel(
-            self.content,
+            self.view_frame,
             text="Plan",
             font=("Segoe UI", 13, "bold"),
             anchor="w",
         )
-        self.plan_items_container = ctk.CTkFrame(
-            self.content,
-            fg_color="#111827",
-            corner_radius=12,
-            border_width=1,
-            border_color="#1F2937",
-        )
-        self.plan_label.pack(anchor="w", padx=16, pady=(12, 4))
-        self.plan_items_container.pack(fill="x", padx=16)
+        self.plan_container = ctk.CTkFrame(self.view_frame, fg_color="#111827", corner_radius=12)
 
-        self.sessions_label = ctk.CTkLabel(
-            self.content,
+        sessions_header = ctk.CTkFrame(self.view_frame, fg_color="transparent")
+        sessions_header.pack(fill="x", padx=18, pady=(12, 0))
+        ctk.CTkLabel(
+            sessions_header,
             text="Sessions",
             font=("Segoe UI", 13, "bold"),
-            anchor="w",
+        ).pack(side="left")
+        self.sessions_manage_btn = ctk.CTkButton(
+            sessions_header,
+            text="Manage entries",
+            width=150,
+            command=self._manage_sessions,
         )
-        self.sessions_label.pack(anchor="w", padx=16, pady=(12, 4))
+        self.sessions_manage_btn.pack(side="right")
 
-        self.sessions_text = ctk.CTkTextbox(self.content, height=170)
-        self.sessions_text.pack(fill="both", expand=True, padx=16)
-        self.sessions_text.insert("1.0", "")
+        self.sessions_text = ctk.CTkTextbox(self.view_frame, height=200)
+        self.sessions_text.pack(fill="both", expand=True, padx=18, pady=(4, 0))
         make_textbox_copyable(self.sessions_text)
 
         self.links_label = ctk.CTkLabel(
-            self.content,
+            self.view_frame,
             text="Links",
             font=("Segoe UI", 13, "bold"),
             anchor="w",
         )
-        self.links_frame = ctk.CTkFrame(self.content, fg_color="transparent")
-        self.links_label.pack(anchor="w", padx=16, pady=(12, 4))
-        self.links_frame.pack(fill="x", padx=16, pady=(0, 16))
+        self.links_frame = ctk.CTkFrame(self.view_frame, fg_color="transparent")
 
-        self.current_task_id: int | None = None
-        self.show_task(None)
+    def _build_edit(self):
+        self.edit_container = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.edit_error = ctk.CTkLabel(
+            self.edit_container,
+            text="",
+            text_color="#F87171",
+            anchor="w",
+        )
+        self.edit_buttons = ctk.CTkFrame(self.edit_container, fg_color="transparent")
+        self.edit_buttons.pack(side="bottom", fill="x", padx=18, pady=(0, 18))
+        self.cancel_edit_btn = ctk.CTkButton(self.edit_buttons, text="Cancel", command=self._exit_edit_mode)
+        self.save_edit_btn = ctk.CTkButton(self.edit_buttons, text="Save changes", command=self._save_edits)
+        self.save_edit_btn.pack(side="right", padx=4)
+        self.cancel_edit_btn.pack(side="right", padx=4)
+        self.edit_error.pack(side="bottom", fill="x", padx=18, pady=(0, 6))
+        self.editor_holder = ctk.CTkFrame(self.edit_container, fg_color="transparent")
+        self.editor_holder.pack(fill="both", expand=True, padx=18, pady=(18, 6))
+
+    def refresh_option_lists(self, people: list[str], labels: list[str]):
+        self._people_options = list(people)
+        self._label_options = list(labels)
+        if self.editor_form:
+            self.editor_form.refresh_options(self._people_options, self._label_options)
 
     def show_task(self, task: dict | None):
         if not task:
-            self.current_task_id = None
-            self._hide_content()
+            self.current_task = None
+            self._exit_edit_mode(silent=True)
+            self._show_placeholder()
             return
+        task_id = task.get("id")
+        if self.mode == "edit" and self.current_task and task_id != self.current_task.get("id"):
+            self._exit_edit_mode()
+        self.current_task = task
+        self._ensure_content_visible()
+        if self.mode == "view":
+            self._render_view(task)
+        elif self.mode == "edit" and self.editor_form:
+            self.editor_form.load_task(task)
 
-        if not self.content.winfo_ismapped():
+    def _ensure_content_visible(self):
+        if not self.content.winfo_manager():
             self.placeholder.pack_forget()
             self.content.pack(fill="both", expand=True)
+        if not self.view_frame.winfo_manager():
+            self.view_frame.pack(fill="both", expand=True)
+        self.mode = "view"
+        self.edit_container.pack_forget()
 
-        self.current_task_id = task.get("id")
+    def _show_placeholder(self):
+        if self.content.winfo_manager():
+            self.content.pack_forget()
+        if not self.placeholder.winfo_manager():
+            self.placeholder.pack(expand=True, padx=18, pady=18)
+        self.mode = "empty"
+        self._set_action_state(False)
+
+    def _render_view(self, task: dict):
         title = task.get("title", "Task")
+        self.title_label.configure(text=title)
         status = task.get("status", "open").capitalize()
         priority = task.get("priority", "Medium")
         task_type = task.get("type", "Make")
@@ -1435,42 +1157,21 @@ class TaskPreviewPane(ctk.CTkFrame):
         start = task.get("start_date") or "—"
         deadline = task.get("deadline") or "—"
         total_minutes = int(task.get("time_spent_minutes", 0) or 0)
-
         meta_lines = [
             f"Type: {task_type} | Priority: {priority} | Status: {status}",
             f"Asked by: {who} | Assignee: {assignee}",
             f"Start: {start} | Deadline: {deadline}",
-            f"Total time: {format_minutes(total_minutes)}",
         ]
-
-        self.title_label.configure(text=title)
         self.meta_label.configure(text="\n".join(meta_lines))
-
+        self.time_label.configure(text=f"Total time: {format_minutes(total_minutes)}")
         self._render_labels(task.get("labels") or [])
-
         description = (task.get("description") or "").strip() or "No description provided."
         self._set_text(self.description_text, description)
-
-        plan_items = [item for item in (task.get("plan") or []) if item.get("text")]
-        self._render_plan(plan_items)
-
+        self._render_plan(task.get("plan") or [])
         sessions_text = self._format_sessions(task)
         self._set_text(self.sessions_text, sessions_text)
-
-        links = gather_task_links(task)
-        self._render_links(links)
-
-    def _hide_content(self):
-        if self.content.winfo_ismapped():
-            self.content.pack_forget()
-        if not self.placeholder.winfo_ismapped():
-            self.placeholder.pack(expand=True, padx=16, pady=16)
-
-    def _set_text(self, widget: ctk.CTkTextbox, value: str) -> None:
-        widget.configure(state="normal")
-        widget.delete("1.0", tk.END)
-        widget.insert("1.0", value)
-        widget.configure(state="disabled")
+        self._render_links(gather_task_links(task))
+        self._update_action_buttons(task)
 
     def _render_labels(self, labels: list[str]):
         for child in self.labels_holder.winfo_children():
@@ -1494,26 +1195,94 @@ class TaskPreviewPane(ctk.CTkFrame):
             ).pack(padx=8, pady=(2, 3))
 
     def _render_plan(self, plan_items: list[dict]):
-        for child in self.plan_items_container.winfo_children():
+        for child in list(self.plan_container.winfo_children()):
             child.destroy()
+        self.plan_rows.clear()
         if not plan_items:
             self.plan_label.pack_forget()
-            self.plan_items_container.pack_forget()
+            self.plan_container.pack_forget()
             return
-        if not self.plan_label.winfo_ismapped():
-            self.plan_label.pack(anchor="w", padx=16, pady=(12, 4))
-            self.plan_items_container.pack(fill="x", padx=16)
+        if not self.plan_label.winfo_manager():
+            self.plan_label.pack(fill="x", padx=18, pady=(10, 0))
+        if not self.plan_container.winfo_manager():
+            self.plan_container.pack(fill="x", padx=18, pady=(4, 8))
         for item in plan_items:
-            row = ctk.CTkFrame(self.plan_items_container, fg_color="transparent")
+            text = item.get("text")
+            if not text:
+                continue
+            row = ctk.CTkFrame(self.plan_container, fg_color="transparent")
             row.pack(fill="x", padx=12, pady=4)
-            icon = "✅" if item.get("completed") else "⬜"
-            when = item.get("completed_at")
-            text = item.get("text", "")
-            if when:
-                label_text = f"{icon} {text} (done {when})"
+            item_id = item.get("id")
+            var = tk.BooleanVar(value=item.get("completed", False))
+            if item_id:
+                chk = ctk.CTkCheckBox(
+                    row,
+                    text="",
+                    width=28,
+                    variable=var,
+                    command=lambda iid=item_id, v=var: self._on_plan_checkbox(iid, v),
+                )
+                chk.pack(side="left", padx=(0, 8))
             else:
-                label_text = f"{icon} {text}"
-            ctk.CTkLabel(row, text=label_text, anchor="w", justify="left", wraplength=360).pack(fill="x")
+                chk = None
+                ctk.CTkLabel(row, text="•", width=10).pack(side="left", padx=(0, 8))
+            label = ctk.CTkLabel(
+                row,
+                text=text,
+                anchor="w",
+                justify="left",
+                wraplength=420,
+            )
+            label.pack(side="left", fill="x", expand=True)
+            if item_id:
+                label.bind(
+                    "<Button-1>",
+                    lambda _e, iid=item_id, v=var: self._toggle_plan_from_label(iid, v),
+                )
+                label.configure(cursor="hand2")
+                self.plan_rows[item_id] = {"var": var, "label": label, "checkbox": chk}
+                self._style_plan_checkbox(item_id)
+            if item.get("completed_at"):
+                ts = item.get("completed_at")
+                ctk.CTkLabel(
+                    row,
+                    text=f"Done at {ts}",
+                    text_color="#9CA3AF",
+                ).pack(side="right")
+
+    def _style_plan_checkbox(self, item_id: str):
+        record = self.plan_rows.get(item_id)
+        if not record:
+            return
+        var: tk.BooleanVar = record["var"]
+        label: ctk.CTkLabel = record["label"]
+        checkbox = record.get("checkbox")
+        checked = bool(var.get())
+        if checkbox:
+            checkbox.configure(fg_color="#34D399" if checked else "#1F2937")
+            checkbox.configure(border_color="#34D399" if checked else "#475569")
+            checkbox.configure(hover_color="#059669" if checked else "#334155")
+        label.configure(text_color="#34D399" if checked else "#E5E7EB")
+
+    def _toggle_plan_from_label(self, item_id: str, var: tk.BooleanVar):
+        var.set(not bool(var.get()))
+        self._on_plan_checkbox(item_id, var)
+
+    def _on_plan_checkbox(self, item_id: str, var: tk.BooleanVar):
+        if not self.current_task:
+            return
+        checked = bool(var.get())
+        success = True
+        if callable(self.on_plan_toggle):
+            success = self.on_plan_toggle(self.current_task, item_id, checked)
+        if success is False:
+            var.set(not checked)
+        else:
+            for item in self.current_task.get("plan", []) or []:
+                if item.get("id") == item_id:
+                    item["completed"] = checked
+                    break
+        self._style_plan_checkbox(item_id)
 
     def _render_links(self, links: list[str]):
         for child in self.links_frame.winfo_children():
@@ -1522,14 +1291,14 @@ class TaskPreviewPane(ctk.CTkFrame):
             self.links_label.pack_forget()
             self.links_frame.pack_forget()
             return
-        if not self.links_label.winfo_ismapped():
-            self.links_label.pack(anchor="w", padx=16, pady=(12, 4))
-            self.links_frame.pack(fill="x", padx=16, pady=(0, 16))
+        if not self.links_label.winfo_manager():
+            self.links_label.pack(fill="x", padx=18, pady=(12, 0))
+            self.links_frame.pack(fill="x", padx=18, pady=(4, 12))
         for url in links:
             btn = ctk.CTkButton(
                 self.links_frame,
                 text=f"🔗 {shorten_url_display(url)}",
-                command=lambda url=url: webbrowser.open(url),
+                command=lambda u=url: webbrowser.open(u),
                 height=32,
                 width=0,
                 fg_color="#1E3A8A",
@@ -1539,6 +1308,12 @@ class TaskPreviewPane(ctk.CTkFrame):
             )
             btn.pack(fill="x", pady=2)
 
+    def _set_text(self, widget: ctk.CTkTextbox, value: str):
+        widget.configure(state="normal")
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", value)
+        widget.configure(state="disabled")
+
     def _format_sessions(self, task: dict) -> str:
         sessions = task.get("sessions") or []
         if not sessions:
@@ -1564,396 +1339,205 @@ class TaskPreviewPane(ctk.CTkFrame):
             lines.append(line)
         return "\n".join(lines)
 
+    def _update_action_buttons(self, task: dict):
+        focus_active = bool(task.get("focus"))
+        self.focus_btn.configure(text="Unfocus" if focus_active else "Add focus")
+        done = task.get("status") == "done"
+        self.done_btn.configure(text="Reopen" if done else "Mark done")
+        self._set_action_state(True)
 
-class LabelsEditor(ctk.CTkFrame):
-    def __init__(self, master, labels: list[str] | None = None, suggestions: list[str] | None = None):
-        super().__init__(master, fg_color="#111827", corner_radius=12)
-        self.grid_columnconfigure(0, weight=1)
-        self._labels: list[str] = []
-        self._suggestions: list[str] = sorted({lbl for lbl in suggestions or [] if lbl})
+    def _set_action_state(self, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        for widget in (self.focus_btn, self.timer_btn, self.log_btn, self.postpone_btn, self.done_btn, self.sessions_manage_btn, self.edit_btn):
+            widget.configure(state=state)
 
-        entry_row = ctk.CTkFrame(self, fg_color="transparent")
-        entry_row.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 4))
-        entry_row.grid_columnconfigure(0, weight=1)
+    def _toggle_focus(self):
+        if self.current_task and callable(self.on_toggle_focus):
+            self.on_toggle_focus(self.current_task)
 
-        self.entry = ctk.CTkEntry(entry_row, placeholder_text="Add a label…")
-        self.entry.grid(row=0, column=0, sticky="ew")
-        self.entry.bind("<Return>", lambda _event: self._add_from_entry())
+    def _toggle_done(self):
+        if self.current_task and callable(self.on_toggle_done):
+            self.on_toggle_done(self.current_task)
 
-        self.add_btn = ctk.CTkButton(entry_row, text="Add", width=72, command=self._add_from_entry)
-        self.add_btn.grid(row=0, column=1, padx=(8, 0))
+    def _start_timer(self):
+        if self.current_task and callable(self.on_start_timer):
+            self.on_start_timer(self.current_task)
 
-        self.suggestion_menu = ctk.CTkOptionMenu(
-            self,
-            values=self._menu_values(),
-            command=self._add_from_menu,
-            width=160,
-        )
-        self.suggestion_menu.grid(row=1, column=0, sticky="ew", padx=12)
-        self.suggestion_menu.set(self._menu_placeholder())
+    def _log_time(self):
+        if self.current_task and callable(self.on_log_time):
+            self.on_log_time(self.current_task)
 
-        self.tokens_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.tokens_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(12, 12))
-        self.tokens_frame.grid_columnconfigure(0, weight=1)
+    def _postpone(self):
+        if self.current_task and callable(self.on_postpone):
+            self.on_postpone(self.current_task)
 
-        self.empty_label = ctk.CTkLabel(
-            self.tokens_frame,
-            text="No labels yet. Use the field above to add keywords.",
-            text_color="#9CA3AF",
-            wraplength=320,
-        )
-        self.empty_label.grid(row=0, column=0, sticky="w")
+    def _manage_sessions(self):
+        if self.current_task and callable(self.on_manage_sessions):
+            self.on_manage_sessions(self.current_task)
 
-        self._token_container = ctk.CTkFrame(self.tokens_frame, fg_color="transparent")
-        self._token_container.grid(row=0, column=0, sticky="w")
-
-        self.set_labels(labels or [])
-
-    def _menu_placeholder(self) -> str:
-        return "Select label…"
-
-    def _menu_values(self) -> list[str]:
-        base = [self._menu_placeholder()]
-        base.extend(self._suggestions)
-        return base
-
-    def _add_from_entry(self):
-        text = self.entry.get().strip()
-        if self._add_label(text):
-            self.entry.delete(0, tk.END)
-
-    def _add_from_menu(self, value: str):
-        if value == self._menu_placeholder():
+    def _enter_edit_mode(self):
+        if not self.current_task or self.mode == "edit":
             return
-        added = self._add_label(value)
-        if added:
-            self.suggestion_menu.set(self._menu_placeholder())
-
-    def _add_label(self, value: str | None) -> bool:
-        if not value:
-            return False
-        cleaned = value.strip()
-        if not cleaned:
-            return False
-        if cleaned in self._labels:
-            return False
-        self._labels.append(cleaned)
-        self._labels.sort()
-        self._refresh_tokens()
-        return True
-
-    def _remove_label(self, value: str):
-        self._labels = [lbl for lbl in self._labels if lbl != value]
-        self._refresh_tokens()
-
-    def _refresh_tokens(self):
-        for child in self._token_container.winfo_children():
+        self.mode = "edit"
+        self.view_frame.pack_forget()
+        if not self.edit_container.winfo_manager():
+            self.edit_container.pack(fill="both", expand=True)
+        for child in self.editor_holder.winfo_children():
             child.destroy()
-        if not self._labels:
-            self._token_container.grid_remove()
-            self.empty_label.grid()
+        self.editor_form = TaskEditorForm(
+            self.editor_holder,
+            people_options=self._people_options,
+            label_options=self._label_options,
+        )
+        self.editor_form.pack(fill="both", expand=True)
+        self.editor_form.load_task(self.current_task)
+        self.edit_error.configure(text="")
+
+    def _exit_edit_mode(self, silent: bool = False):
+        if self.mode != "edit":
+            if not silent:
+                self._set_action_state(bool(self.current_task))
             return
-        self.empty_label.grid_remove()
-        self._token_container.grid()
-        for idx, label in enumerate(self._labels):
-            pill = ctk.CTkFrame(self._token_container, fg_color="#1F2937", corner_radius=14)
-            pill.grid(row=0, column=idx, padx=4, pady=4, sticky="w")
-            text_label = ctk.CTkLabel(pill, text=label, text_color="#E2E8F0")
-            text_label.pack(side="left", padx=(8, 4), pady=4)
-            remove_btn = ctk.CTkButton(
-                pill,
-                text="✕",
-                width=28,
-                height=28,
-                command=lambda lbl=label: self._remove_label(lbl),
-                fg_color="#991B1B",
-                hover_color="#B91C1C",
-            )
-            remove_btn.pack(side="left", padx=(0, 6), pady=4)
+        self.mode = "view"
+        self.edit_container.pack_forget()
+        self.view_frame.pack(fill="both", expand=True)
+        for child in self.editor_holder.winfo_children():
+            child.destroy()
+        self.editor_form = None
+        if self.current_task and not silent:
+            self._render_view(self.current_task)
 
-    def get_labels(self) -> list[str]:
-        return list(self._labels)
-
-    def set_labels(self, labels: list[str]):
-        cleaned: list[str] = []
-        for label in labels or []:
-            if not label:
-                continue
-            text = str(label).strip()
-            if text and text not in cleaned:
-                cleaned.append(text)
-        self._labels = sorted(cleaned)
-        self._refresh_tokens()
-
-    def set_suggestions(self, suggestions: list[str]):
-        self._suggestions = sorted({lbl for lbl in suggestions or [] if lbl})
-        values = self._menu_values()
-        self.suggestion_menu.configure(values=values)
-        if self.suggestion_menu.get() not in values:
-            self.suggestion_menu.set(self._menu_placeholder())
-class TaskEditor(ctk.CTkToplevel):
-    def __init__(
-        self,
-        master,
-        task: dict,
-        on_save,
-        people: list[str],
-        store: TaskStore,
-        on_close=None,
-        on_change=None,
-    ):
-        super().__init__(master)
-        self.title("Edit Task")
-        self.geometry("620x640")
-        self.resizable(True, True)
-        self.transient(master)
-        self.lift()
-        self.grab_set()
-        self.focus_force()
+    def _save_edits(self):
+        if not self.current_task or not self.editor_form:
+            return
         try:
-            self.attributes("-topmost", True)
-            self.after(150, lambda: self.attributes("-topmost", False))
-        except tk.TclError:
-            pass
-        self.store = store
-        self.on_change = on_change
-        self.task = task.copy()
-        self.task_id = task.get("id")
-        self.on_save = on_save
-        self.on_close = on_close
-        self.protocol("WM_DELETE_WINDOW", self._close)
-        initial_people = {p for p in people if p}
-        initial_people.update({task.get("who_asked", ""), task.get("assignee", "")})
-        self.people = sorted({p for p in initial_people if p})
+            payload = self.editor_form.get_payload()
+        except ValueError as exc:
+            self.edit_error.configure(text=str(exc))
+            return
+        success = True
+        if callable(self.on_save):
+            success = self.on_save(self.current_task.get("id"), payload)
+        if success is False:
+            self.edit_error.configure(text="Unable to save changes.")
+            return
+        self.edit_error.configure(text="")
+        self._exit_edit_mode()
 
-        container = ctk.CTkFrame(self)
-        container.pack(fill="both", expand=True, padx=16, pady=16)
-        self.container = container
-        self.links_label = None
-        self.links_frame = None
-        self.links: list[str] = []
 
-        # Title
-        ctk.CTkLabel(container, text="Title").grid(row=0, column=0, sticky="w", pady=(0,4))
+class TaskEditorForm(ctk.CTkFrame):
+    def __init__(self, master, *, people_options: list[str], label_options: list[str]):
+        super().__init__(master, fg_color="transparent")
+        self.people_options = list(people_options)
+        self.label_options = list(label_options)
+        self.task: dict | None = None
+        self._build_form()
+
+    def _build_form(self):
+        container = ctk.CTkFrame(self, fg_color="transparent")
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.columnconfigure(1, weight=1)
+        container.rowconfigure(6, weight=1)
+        container.rowconfigure(9, weight=1)
+
+        ctk.CTkLabel(container, text="Title").grid(row=0, column=0, columnspan=2, sticky="w")
         self.title_entry = ctk.CTkEntry(container)
-        self.title_entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0,8))
-        self.title_entry.insert(0, task.get("title", ""))
+        self.title_entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
 
-        # Type + Priority
         ctk.CTkLabel(container, text="Type").grid(row=2, column=0, sticky="w")
         self.type_menu = ctk.CTkOptionMenu(container, values=TASK_TYPES)
-        self.type_menu.grid(row=3, column=0, sticky="ew", pady=(0,8))
-        self.type_menu.set(task.get("type", TASK_TYPES[0]))
+        self.type_menu.grid(row=3, column=0, sticky="ew", pady=(0, 8))
 
         ctk.CTkLabel(container, text="Priority").grid(row=2, column=1, sticky="w")
-        self.pr_menu = ctk.CTkOptionMenu(container, values=PRIORITIES)
-        self.pr_menu.grid(row=3, column=1, sticky="ew", pady=(0,8))
-        self.pr_menu.set(task.get("priority", PRIORITIES[1]))
+        self.priority_menu = ctk.CTkOptionMenu(container, values=PRIORITIES)
+        self.priority_menu.grid(row=3, column=1, sticky="ew", pady=(0, 8))
 
-        # Who asked & Assignee
         ctk.CTkLabel(container, text="Who asked").grid(row=4, column=0, sticky="w")
         self.who_entry = ctk.CTkComboBox(container, values=self._people_values(), justify="left")
-        self.who_entry.grid(row=5, column=0, sticky="ew", pady=(0,8))
-        self.who_entry.set(task.get("who_asked", ""))
+        self.who_entry.grid(row=5, column=0, sticky="ew", pady=(0, 8))
 
         ctk.CTkLabel(container, text="Assignee").grid(row=4, column=1, sticky="w")
         self.assignee_entry = ctk.CTkComboBox(container, values=self._people_values(), justify="left")
-        self.assignee_entry.grid(row=5, column=1, sticky="ew", pady=(0,8))
-        self.assignee_entry.set(task.get("assignee", ""))
+        self.assignee_entry.grid(row=5, column=1, sticky="ew", pady=(0, 8))
 
-        # Start & Deadline (tkcalendar)
-        ctk.CTkLabel(container, text="Start Date").grid(row=6, column=0, sticky="w")
-        self.start_date = create_dark_date_entry(container)
-        self.start_date.grid(row=7, column=0, sticky="ew", pady=(0,8))
-        sd = parse_date(task.get("start_date", "")) or date.today()
-        self.start_date.set_date(sd)
+        ctk.CTkLabel(container, text="Start date").grid(row=6, column=0, sticky="w")
+        self.start_entry = create_dark_date_entry(container)
+        self.start_entry.grid(row=7, column=0, sticky="ew", pady=(0, 8))
 
         ctk.CTkLabel(container, text="Deadline").grid(row=6, column=1, sticky="w")
-        self.deadline = create_dark_date_entry(container)
-        self.deadline.grid(row=7, column=1, sticky="ew", pady=(0,8))
-        dl = parse_date(task.get("deadline", "")) or date.today()
-        self.deadline.set_date(dl)
+        self.deadline_entry = create_dark_date_entry(container)
+        self.deadline_entry.grid(row=7, column=1, sticky="ew", pady=(0, 8))
 
-        # Description
         ctk.CTkLabel(container, text="Description").grid(row=8, column=0, columnspan=2, sticky="w")
         self.description_box = ctk.CTkTextbox(container, height=160)
-        self.description_box.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(0,8))
-        self.description_box.insert("1.0", task.get("description", ""))
+        self.description_box.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
 
-        # Labels
-        ctk.CTkLabel(container, text="Labels").grid(row=10, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.labels_editor = LabelsEditor(container, task.get("labels", []), store.get_labels())
+        ctk.CTkLabel(container, text="Labels").grid(row=10, column=0, columnspan=2, sticky="w")
+        self.labels_editor = LabelsEditor(container, [], self.label_options)
         self.labels_editor.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(0, 8))
 
-        # Plan checklist
-        plan_label = ctk.CTkLabel(container, text="Plan checklist")
-        plan_label.grid(row=12, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.plan_editor = PlanEditorFrame(container, task.get("plan", []))
+        ctk.CTkLabel(container, text="Plan checklist").grid(row=12, column=0, columnspan=2, sticky="w")
+        self.plan_editor = PlanEditorFrame(container, [])
         self.plan_editor.grid(row=13, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
 
-        # Session history (read-only)
-        history_header = ctk.CTkFrame(container, fg_color="transparent")
-        history_header.grid(row=14, column=0, columnspan=2, sticky="ew")
-        ctk.CTkLabel(history_header, text="Session history").pack(side="left")
-        ctk.CTkButton(
-            history_header,
-            text="Manage sessions",
-            width=150,
-            command=self._open_session_manager,
-        ).pack(side="right")
-
-        self.history_box = ctk.CTkTextbox(container, height=140)
-        self.history_box.grid(row=15, column=0, columnspan=2, sticky="nsew", pady=(0,8))
-        self.history_box.insert("1.0", self._format_sessions(task))
-        make_textbox_copyable(self.history_box)
-
-        self._render_links_section(container, 16, task)
-        next_row = 18
-
-        # Status + Focus
-        ctk.CTkLabel(container, text="Status").grid(row=next_row, column=0, sticky="w")
+        ctk.CTkLabel(container, text="Status").grid(row=14, column=0, sticky="w")
         self.status_menu = ctk.CTkOptionMenu(container, values=STATUSES)
-        self.status_menu.grid(row=next_row + 1, column=0, sticky="ew", pady=(0,8))
+        self.status_menu.grid(row=15, column=0, sticky="ew", pady=(0, 12))
+
+        self.focus_var = tk.BooleanVar(value=False)
+        self.focus_check = ctk.CTkCheckBox(container, text="Focus for today", variable=self.focus_var)
+        self.focus_check.grid(row=15, column=1, sticky="w")
+
+    def _people_values(self) -> list[str]:
+        return [""] + sorted({p for p in self.people_options if p})
+
+    def refresh_options(self, people: list[str], labels: list[str]):
+        self.people_options = list(people)
+        self.label_options = list(labels)
+        values = self._people_values()
+        self.who_entry.configure(values=values)
+        self.assignee_entry.configure(values=values)
+        self.labels_editor.set_suggestions(self.label_options)
+
+    def load_task(self, task: dict):
+        self.task = task.copy()
+        self.title_entry.delete(0, tk.END)
+        self.title_entry.insert(0, task.get("title", ""))
+        self.type_menu.set(task.get("type", TASK_TYPES[0]))
+        self.priority_menu.set(task.get("priority", PRIORITIES[1]))
+        self.who_entry.set(task.get("who_asked", ""))
+        self.assignee_entry.set(task.get("assignee", ""))
+        sd = parse_date(task.get("start_date", "")) or date.today()
+        self.start_entry.set_date(sd)
+        dl = parse_date(task.get("deadline", "")) or date.today()
+        self.deadline_entry.set_date(dl)
+        self.description_box.delete("1.0", tk.END)
+        self.description_box.insert("1.0", task.get("description", ""))
+        self.labels_editor.set_labels(task.get("labels", []))
+        self.plan_editor.load_plan(task.get("plan", []))
         self.status_menu.set(task.get("status", "open"))
+        self.focus_var.set(bool(task.get("focus")))
 
-        self.focus_var = tk.BooleanVar(value=task.get("focus", False))
-        self.focus_chk = ctk.CTkCheckBox(container, text="Focus for Today", variable=self.focus_var)
-        self.focus_chk.grid(row=next_row + 1, column=1, sticky="w")
-
-        # Buttons
-        btns = ctk.CTkFrame(container, fg_color="transparent")
-        btns.grid(row=next_row + 2, column=0, columnspan=2, sticky="e", pady=(8,0))
-        ctk.CTkButton(btns, text="Cancel", command=self._close).pack(side="right", padx=6)
-        ctk.CTkButton(btns, text="Save", command=self._save).pack(side="right", padx=6)
-
-        container.columnconfigure(0, weight=1)
-        container.columnconfigure(1, weight=1)
-        container.rowconfigure(9, weight=1)
-        container.rowconfigure(13, weight=1)
-        container.rowconfigure(15, weight=1)
-
-    def _save(self):
-        updated = {
-            "title": self.title_entry.get().strip(),
+    def get_payload(self) -> dict:
+        title = self.title_entry.get().strip()
+        if not title:
+            raise ValueError("Title cannot be empty.")
+        payload = {
+            "title": title,
             "type": self.type_menu.get(),
-            "priority": self.pr_menu.get(),
+            "priority": self.priority_menu.get(),
             "who_asked": self.who_entry.get().strip(),
             "assignee": self.assignee_entry.get().strip(),
-            "start_date": self.start_date.get_date().strftime('%Y-%m-%d'),
-            "deadline": self.deadline.get_date().strftime('%Y-%m-%d'),
-            "status": self.status_menu.get(),
-            "focus": bool(self.focus_var.get()),
+            "start_date": self.start_entry.get_date().strftime('%Y-%m-%d'),
+            "deadline": self.deadline_entry.get_date().strftime('%Y-%m-%d'),
             "description": self.description_box.get("1.0", tk.END).strip(),
             "labels": self.labels_editor.get_labels(),
             "plan": self.plan_editor.get_plan(),
+            "status": self.status_menu.get(),
+            "focus": bool(self.focus_var.get()),
         }
-        if not updated["title"]:
-            messagebox.showwarning("Validation", "Title cannot be empty")
-            return
-        if self.on_save:
-            self.on_save(updated)
-        self._close()
-
-    def _close(self):
-        callback = self.on_close
-        self.on_close = None
-        try:
-            self.grab_release()
-        except tk.TclError:
-            pass
-        if callable(callback):
-            callback()
-        if self.winfo_exists():
-            super().destroy()
-
-    def _people_values(self) -> list[str]:
-        return [""] + self.people
-
-    def _format_sessions(self, task: dict) -> str:
-        sessions = task.get("sessions") or []
-        if not sessions:
-            return "No sessions recorded yet."
-        lines = []
-        for session in sessions:
-            ts = session.get("timestamp", "?")
-            minutes = session.get("minutes", 0)
-            note = session.get("note", "")
-            line = f"{ts} — {minutes} min"
-            if note:
-                line += f": {note}"
-            plan_ids = session.get("plan_items") or []
-            if plan_ids:
-                related = [
-                    item.get("text", "")
-                    for item in task.get("plan", [])
-                    if item.get("id") in plan_ids
-                ]
-                related = [text for text in related if text]
-                if related:
-                    line += f" [Plan: {', '.join(related)}]"
-            lines.append(line)
-        return "\n".join(lines)
-
-    def _render_links_section(self, container, base_row: int, task: dict) -> None:
-        if self.links_label is None:
-            self.links_label = ctk.CTkLabel(container, text="")
-        if self.links_frame is None:
-            self.links_frame = ctk.CTkFrame(container, fg_color="transparent")
-        for child in list(self.links_frame.winfo_children()):
-            child.destroy()
-        self.links = gather_task_links(task)
-        if self.links:
-            self.links_label.configure(text=f"Links ({len(self.links)})")
-            self.links_label.grid(row=base_row, column=0, columnspan=2, sticky="w")
-            self.links_frame.grid(row=base_row + 1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-            for url in self.links:
-                btn = ctk.CTkButton(
-                    self.links_frame,
-                    text=f"🔗 {shorten_url_display(url)}",
-                    command=lambda url=url: webbrowser.open(url),
-                    height=30,
-                    width=0,
-                    fg_color="#1E3A8A",
-                    hover_color="#1D4ED8",
-                    text_color="#E0E7FF",
-                    font=("Segoe UI", 13),
-                    cursor="hand2",
-                )
-                btn.pack(fill="x", pady=2)
-        else:
-            self.links_label.grid_remove()
-            self.links_frame.grid_remove()
-
-    def _open_session_manager(self):
-        if not self.store or not self.task_id:
-            return
-        dialog = SessionManagerDialog(
-            self,
-            store=self.store,
-            task_id=self.task_id,
-            task_title=self.task.get("title", "Task"),
-        )
-        changed = dialog.show()
-        if changed:
-            self._reload_task_state()
-            if callable(self.on_change):
-                self.on_change()
-
-    def _reload_task_state(self):
-        if not self.store or not self.task_id:
-            return
-        latest = self.store.get_task(self.task_id)
-        if not latest:
-            return
-        self.task = latest.copy()
-        self.history_box.configure(state="normal")
-        self.history_box.delete("1.0", tk.END)
-        self.history_box.insert("1.0", self._format_sessions(latest))
-        self.history_box.configure(state="disabled")
-        self.plan_editor.load_plan(latest.get("plan", []))
-        self.labels_editor.set_labels(latest.get("labels", []))
-        self.labels_editor.set_suggestions(self.store.get_labels())
-        self._render_links_section(self.container, 16, latest)
+        return payload
 
 
 class PlanEditorFrame(ctk.CTkFrame):
@@ -2685,7 +2269,6 @@ class TaskFocusApp(ctk.CTk):
         self.people_options = self.store.get_people()
         self.label_options = self.store.get_labels()
         self.timer_window = None
-        self.editor_window = None
         self._layout_mode: str | None = None
         self._widget_scale: float | None = None
         self._responsive_after: str | None = None
@@ -2752,21 +2335,25 @@ class TaskFocusApp(ctk.CTk):
             self.add_who.configure(values=values)
         if hasattr(self, "add_assignee"):
             self.add_assignee.configure(values=values)
+        if hasattr(self, "today_preview"):
+            self.today_preview.refresh_option_lists(values, self.label_options)
+        if hasattr(self, "all_preview"):
+            self.all_preview.refresh_option_lists(values, self.label_options)
 
     def _refresh_label_options(self):
         self.label_options = self.store.get_labels()
         if hasattr(self, "add_labels_editor"):
             self.add_labels_editor.set_suggestions(self.label_options)
-        if self.editor_window and self.editor_window.winfo_exists():
-            editor = self.editor_window
-            if hasattr(editor, "labels_editor"):
-                editor.labels_editor.set_suggestions(self.label_options)
         if hasattr(self, "report_label_filter"):
             values = ["All labels"] + self.label_options
             current = self.report_label_filter.get()
             self.report_label_filter.configure(values=values)
             if current not in values:
                 self.report_label_filter.set("All labels")
+        if hasattr(self, "today_preview"):
+            self.today_preview.refresh_option_lists(self._people_option_values(), self.label_options)
+        if hasattr(self, "all_preview"):
+            self.all_preview.refresh_option_lists(self._people_option_values(), self.label_options)
 
     def _build_today_tab(self):
         # Top bar
@@ -2800,7 +2387,19 @@ class TaskFocusApp(ctk.CTk):
         self.today_list = ctk.CTkScrollableFrame(today_content)
         self.today_list.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
 
-        self.today_preview = TaskPreviewPane(today_content)
+        self.today_preview = TaskDetailPane(
+            today_content,
+            on_toggle_done=self._toggle_done,
+            on_toggle_focus=self._toggle_focus,
+            on_start_timer=self._start_task_timer,
+            on_log_time=self._log_manual_time,
+            on_postpone=self._postpone_task,
+            on_plan_toggle=self._toggle_plan_item,
+            on_manage_sessions=self._manage_sessions,
+            on_save=self._save_task_changes,
+            people_options=self._people_option_values(),
+            label_options=self.label_options,
+        )
         self.today_preview.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
 
     def _build_all_tab(self):
@@ -2838,7 +2437,19 @@ class TaskFocusApp(ctk.CTk):
         self.all_list = ctk.CTkScrollableFrame(all_content)
         self.all_list.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
 
-        self.all_preview = TaskPreviewPane(all_content)
+        self.all_preview = TaskDetailPane(
+            all_content,
+            on_toggle_done=self._toggle_done,
+            on_toggle_focus=self._toggle_focus,
+            on_start_timer=self._start_task_timer,
+            on_log_time=self._log_manual_time,
+            on_postpone=self._postpone_task,
+            on_plan_toggle=self._toggle_plan_item,
+            on_manage_sessions=self._manage_sessions,
+            on_save=self._save_task_changes,
+            people_options=self._people_option_values(),
+            label_options=self.label_options,
+        )
         self.all_preview.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
 
     def _build_stats_tab(self):
@@ -3699,16 +3310,12 @@ class TaskFocusApp(ctk.CTk):
 
     def _add_task_card(self, parent, task: dict):
         is_selected = bool(self.selected_task_id and task.get("id") == self.selected_task_id)
-        card = TaskCard(parent, task,
-                        on_edit=self._open_editor,
-                        on_done_toggle=self._toggle_done,
-                        on_focus_toggle=self._toggle_focus,
-                        on_start_timer=self._start_task_timer,
-                        on_log_time=self._log_manual_time,
-                        on_plan_toggle=self._toggle_plan_item,
-                        on_postpone=self._postpone_task,
-                        on_select=self._on_task_card_selected,
-                        selected=is_selected)
+        card = TaskCard(
+            parent,
+            task,
+            on_select=self._on_task_card_selected,
+            selected=is_selected,
+        )
         card.pack(fill="x", padx=12, pady=10)
         if is_selected:
             self._selected_card_widget = card
@@ -3776,29 +3383,12 @@ class TaskFocusApp(ctk.CTk):
         self.refresh_all(data_changed=True)
         return True
 
-    def _open_editor(self, task):
-        if self.editor_window and self.editor_window.winfo_exists():
-            self.editor_window.focus_force()
-            self.editor_window.lift()
-            return
-
-        def on_save(updated):
-            self.store.update_task(task["id"], updated)
-            self.refresh_all(data_changed=True)
-
-        def on_close():
-            self.editor_window = None
-
-        self.editor_window = TaskEditor(
-            self,
-            task,
-            on_save,
-            self.store.get_people(),
-            self.store,
-            on_close=on_close,
-            on_change=lambda: self.refresh_all(data_changed=True),
-        )
-        self.editor_window.focus_force()
+    def _save_task_changes(self, task_id: int | None, updates: dict) -> bool:
+        if not task_id:
+            return False
+        self.store.update_task(task_id, updates)
+        self.refresh_all(data_changed=True)
+        return True
 
     def _start_task_timer(self, task):
         if self.timer_window and self.timer_window.winfo_exists():
@@ -3822,7 +3412,7 @@ class TaskFocusApp(ctk.CTk):
         if minutes <= 0:
             return
         self.bell()
-        task = next((t for t in self.store.data.get("tasks", []) if t.get("id") == task_id), None)
+        task = self.store.get_task(task_id)
         if not task:
             messagebox.showinfo("Timer", "Task no longer exists.")
             return
@@ -3871,6 +3461,20 @@ class TaskFocusApp(ctk.CTk):
         # Manual logging mirrors timer sessions without touching the description field.
         self.store.append_session(task_id, minutes, note, plan_item_ids=plan_ids)
         self.refresh_all(data_changed=True)
+
+    def _manage_sessions(self, task):
+        task_id = task.get("id") if task else None
+        if not task_id:
+            return
+        dialog = SessionManagerDialog(
+            self,
+            store=self.store,
+            task_id=task_id,
+            task_title=task.get("title", "Task"),
+        )
+        changed = dialog.show()
+        if changed:
+            self.refresh_all(data_changed=True)
 
     def _postpone_task(self, task):
         task_id = task.get("id") if task else None
