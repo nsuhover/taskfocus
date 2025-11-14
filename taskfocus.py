@@ -381,6 +381,43 @@ def make_textbox_copyable(textbox: ctk.CTkTextbox):
     textbox.bind("<Button-2>", show_menu)
 
 
+def configure_fast_scroll(scrollable, multiplier: int = 3):
+    """Accelerate mouse-wheel scrolling on CustomTkinter scrollable widgets."""
+
+    canvas = getattr(scrollable, "_parent_canvas", None)
+    if canvas is None:
+        return
+    body = getattr(scrollable, "scrollable_frame", None)
+
+    def _on_mousewheel(event):
+        delta = event.delta
+        if delta == 0:
+            return "break"
+        if sys.platform == "darwin":
+            steps = -int(delta) * multiplier
+        else:
+            steps = -int(delta / 120) * multiplier
+        if steps:
+            canvas.yview_scroll(steps, "units")
+        return "break"
+
+    def _on_linux_up(_event):
+        canvas.yview_scroll(-multiplier, "units")
+        return "break"
+
+    def _on_linux_down(_event):
+        canvas.yview_scroll(multiplier, "units")
+        return "break"
+
+    targets = [canvas]
+    if body not in (None, canvas):
+        targets.append(body)
+    for widget in targets:
+        widget.bind("<MouseWheel>", _on_mousewheel, add="+")
+        widget.bind("<Button-4>", _on_linux_up, add="+")
+        widget.bind("<Button-5>", _on_linux_down, add="+")
+
+
 def shorten_url_display(url: str, max_length: int = 36) -> str:
     parsed = urlparse(url)
     display = url
@@ -838,6 +875,7 @@ class TaskCard(ctk.CTkFrame):
         self._selected = bool(selected)
         self._default_border_color = "#1E1B4B"
         self._selected_border_color = "#7C3AED"
+        self._hover_border_color = "#5B21B6"
 
         self.configure(
             fg_color="#0F172A",
@@ -908,9 +946,13 @@ class TaskCard(ctk.CTkFrame):
         )
         self.focus_label.pack(fill="x", pady=(12, 0))
 
-        self.bind("<Button-1>", self._handle_click, add="+")
-        container.bind("<Button-1>", self._handle_click, add="+")
-        meta.bind("<Button-1>", self._handle_click, add="+")
+        self._bind_click_targets(self)
+        self._bind_click_targets(container)
+        self._bind_click_targets(meta)
+        self.bind("<Enter>", self._on_enter, add="+")
+        self.bind("<Leave>", self._on_leave, add="+")
+        container.bind("<Enter>", self._on_enter, add="+")
+        container.bind("<Leave>", self._on_leave, add="+")
         self.set_selected(self._selected)
 
     def _add_meta_row(
@@ -937,6 +979,19 @@ class TaskCard(ctk.CTkFrame):
         self._selected = bool(selected)
         border = self._selected_border_color if self._selected else self._default_border_color
         self.configure(border_color=border)
+
+    def _bind_click_targets(self, widget):
+        widget.bind("<Button-1>", self._handle_click, add="+")
+        for child in widget.winfo_children():
+            self._bind_click_targets(child)
+
+    def _on_enter(self, _event):
+        if not self._selected:
+            self.configure(border_color=self._hover_border_color)
+
+    def _on_leave(self, _event):
+        if not self._selected:
+            self.configure(border_color=self._default_border_color)
 
 
 class TaskDetailPane(ctk.CTkFrame):
@@ -976,6 +1031,7 @@ class TaskDetailPane(ctk.CTkFrame):
         self.mode = "empty"
         self.plan_rows: dict[str, dict[str, object]] = {}
         self.editor_form: TaskEditorForm | None = None
+        self._last_signature = None
 
         self.placeholder = ctk.CTkLabel(
             self,
@@ -992,7 +1048,9 @@ class TaskDetailPane(ctk.CTkFrame):
         self._show_placeholder()
 
     def _build_view(self):
-        self.view_frame = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.view_scroll = ctk.CTkScrollableFrame(self.content, fg_color="transparent")
+        configure_fast_scroll(self.view_scroll, multiplier=2)
+        self.view_frame = getattr(self.view_scroll, "scrollable_frame", self.view_scroll)
 
         header = ctk.CTkFrame(self.view_frame, fg_color="transparent")
         header.pack(fill="x", padx=18, pady=(18, 8))
@@ -1013,14 +1071,27 @@ class TaskDetailPane(ctk.CTkFrame):
         )
         self.edit_btn.pack(side="right")
 
-        self.meta_label = ctk.CTkLabel(
-            self.view_frame,
-            text="",
-            justify="left",
-            anchor="w",
-            font=("Segoe UI", 12),
-        )
-        self.meta_label.pack(fill="x", padx=18)
+        self.meta_grid = ctk.CTkFrame(self.view_frame, fg_color="#111827", corner_radius=14)
+        self.meta_grid.pack(fill="x", padx=18, pady=(0, 6))
+        self.meta_grid.grid_columnconfigure(0, weight=1)
+        self.meta_grid.grid_columnconfigure(1, weight=1)
+        self.meta_values: dict[str, ctk.CTkLabel] = {}
+        meta_fields = [
+            ("Type", "type"),
+            ("Priority", "priority"),
+            ("Status", "status"),
+            ("Start", "start"),
+            ("Deadline", "deadline"),
+            ("Asked by", "who"),
+            ("Assignee", "assignee"),
+        ]
+        for idx, (label, key) in enumerate(meta_fields):
+            row = ctk.CTkFrame(self.meta_grid, fg_color="transparent")
+            row.grid(row=idx // 2, column=idx % 2, sticky="ew", padx=10, pady=6)
+            ctk.CTkLabel(row, text=label, text_color="#94A3B8", font=("Segoe UI", 11)).pack(anchor="w")
+            value_label = ctk.CTkLabel(row, text="—", font=("Segoe UI", 13, "bold"), anchor="w")
+            value_label.pack(anchor="w")
+            self.meta_values[key] = value_label
 
         self.time_label = ctk.CTkLabel(
             self.view_frame,
@@ -1050,8 +1121,16 @@ class TaskDetailPane(ctk.CTkFrame):
             anchor="w",
         )
         desc_label.pack(fill="x", padx=18, pady=(8, 0))
-        self.description_text = ctk.CTkTextbox(self.view_frame, height=200)
-        self.description_text.pack(fill="both", expand=False, padx=18)
+        self.description_section = ctk.CTkFrame(self.view_frame, fg_color="#111827", corner_radius=12)
+        self.description_section.pack(fill="both", padx=18)
+        self.description_text = ctk.CTkTextbox(self.description_section, height=200)
+        self.description_text.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=12)
+        self.description_scroll = ctk.CTkScrollbar(
+            self.description_section,
+            command=self.description_text.yview,
+        )
+        self.description_scroll.pack(side="right", fill="y", padx=(6, 12), pady=12)
+        self.description_text.configure(yscrollcommand=self.description_scroll.set)
         make_textbox_copyable(self.description_text)
 
         self.plan_label = ctk.CTkLabel(
@@ -1060,7 +1139,14 @@ class TaskDetailPane(ctk.CTkFrame):
             font=("Segoe UI", 13, "bold"),
             anchor="w",
         )
-        self.plan_container = ctk.CTkFrame(self.view_frame, fg_color="#111827", corner_radius=12)
+        self.plan_container = ctk.CTkScrollableFrame(
+            self.view_frame,
+            fg_color="#111827",
+            corner_radius=12,
+            height=160,
+        )
+        configure_fast_scroll(self.plan_container, multiplier=2)
+        self.plan_body = getattr(self.plan_container, "scrollable_frame", self.plan_container)
 
         sessions_header = ctk.CTkFrame(self.view_frame, fg_color="transparent")
         sessions_header.pack(fill="x", padx=18, pady=(12, 0))
@@ -1077,8 +1163,16 @@ class TaskDetailPane(ctk.CTkFrame):
         )
         self.sessions_manage_btn.pack(side="right")
 
-        self.sessions_text = ctk.CTkTextbox(self.view_frame, height=200)
-        self.sessions_text.pack(fill="both", expand=True, padx=18, pady=(4, 0))
+        self.sessions_section = ctk.CTkFrame(self.view_frame, fg_color="#111827", corner_radius=12)
+        self.sessions_section.pack(fill="both", expand=True, padx=18, pady=(4, 0))
+        self.sessions_text = ctk.CTkTextbox(self.sessions_section, height=200)
+        self.sessions_text.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=12)
+        self.sessions_scroll = ctk.CTkScrollbar(
+            self.sessions_section,
+            command=self.sessions_text.yview,
+        )
+        self.sessions_scroll.pack(side="right", fill="y", padx=(6, 12), pady=12)
+        self.sessions_text.configure(yscrollcommand=self.sessions_scroll.set)
         make_textbox_copyable(self.sessions_text)
 
         self.links_label = ctk.CTkLabel(
@@ -1116,16 +1210,29 @@ class TaskDetailPane(ctk.CTkFrame):
     def show_task(self, task: dict | None):
         if not task:
             self.current_task = None
+            self._last_signature = None
             self._exit_edit_mode(silent=True)
             self._show_placeholder()
             return
         task_id = task.get("id")
         if self.mode == "edit" and self.current_task and task_id != self.current_task.get("id"):
             self._exit_edit_mode()
+        signature = self._build_signature(task)
+        should_render = True
+        if (
+            self.mode == "view"
+            and self.current_task
+            and task_id == self.current_task.get("id")
+            and signature == self._last_signature
+        ):
+            should_render = False
         self.current_task = task
         self._ensure_content_visible()
         if self.mode == "view":
-            self._render_view(task)
+            if should_render:
+                self._render_view(task, signature)
+            else:
+                self._update_action_buttons(task)
         elif self.mode == "edit" and self.editor_form:
             self.editor_form.load_task(task)
 
@@ -1133,8 +1240,8 @@ class TaskDetailPane(ctk.CTkFrame):
         if not self.content.winfo_manager():
             self.placeholder.pack_forget()
             self.content.pack(fill="both", expand=True)
-        if not self.view_frame.winfo_manager():
-            self.view_frame.pack(fill="both", expand=True)
+        if not self.view_scroll.winfo_manager():
+            self.view_scroll.pack(fill="both", expand=True)
         self.mode = "view"
         self.edit_container.pack_forget()
 
@@ -1146,7 +1253,7 @@ class TaskDetailPane(ctk.CTkFrame):
         self.mode = "empty"
         self._set_action_state(False)
 
-    def _render_view(self, task: dict):
+    def _render_view(self, task: dict, signature=None):
         title = task.get("title", "Task")
         self.title_label.configure(text=title)
         status = task.get("status", "open").capitalize()
@@ -1157,21 +1264,29 @@ class TaskDetailPane(ctk.CTkFrame):
         start = task.get("start_date") or "—"
         deadline = task.get("deadline") or "—"
         total_minutes = int(task.get("time_spent_minutes", 0) or 0)
-        meta_lines = [
-            f"Type: {task_type} | Priority: {priority} | Status: {status}",
-            f"Asked by: {who} | Assignee: {assignee}",
-            f"Start: {start} | Deadline: {deadline}",
-        ]
-        self.meta_label.configure(text="\n".join(meta_lines))
+        self._update_meta(
+            {
+                "type": task_type,
+                "priority": priority,
+                "status": status,
+                "start": start,
+                "deadline": deadline,
+                "who": who,
+                "assignee": assignee,
+            }
+        )
         self.time_label.configure(text=f"Total time: {format_minutes(total_minutes)}")
         self._render_labels(task.get("labels") or [])
         description = (task.get("description") or "").strip() or "No description provided."
         self._set_text(self.description_text, description)
+        self._auto_resize_textbox(self.description_text, description, min_lines=4, max_lines=14)
         self._render_plan(task.get("plan") or [])
         sessions_text = self._format_sessions(task)
         self._set_text(self.sessions_text, sessions_text)
+        self._auto_resize_textbox(self.sessions_text, sessions_text, min_lines=4, max_lines=16)
         self._render_links(gather_task_links(task))
         self._update_action_buttons(task)
+        self._last_signature = signature or self._build_signature(task)
 
     def _render_labels(self, labels: list[str]):
         for child in self.labels_holder.winfo_children():
@@ -1195,7 +1310,7 @@ class TaskDetailPane(ctk.CTkFrame):
             ).pack(padx=8, pady=(2, 3))
 
     def _render_plan(self, plan_items: list[dict]):
-        for child in list(self.plan_container.winfo_children()):
+        for child in list(self.plan_body.winfo_children()):
             child.destroy()
         self.plan_rows.clear()
         if not plan_items:
@@ -1206,11 +1321,13 @@ class TaskDetailPane(ctk.CTkFrame):
             self.plan_label.pack(fill="x", padx=18, pady=(10, 0))
         if not self.plan_container.winfo_manager():
             self.plan_container.pack(fill="x", padx=18, pady=(4, 8))
+        visible_rows = 0
         for item in plan_items:
             text = item.get("text")
             if not text:
                 continue
-            row = ctk.CTkFrame(self.plan_container, fg_color="transparent")
+            visible_rows += 1
+            row = ctk.CTkFrame(self.plan_body, fg_color="transparent")
             row.pack(fill="x", padx=12, pady=4)
             item_id = item.get("id")
             var = tk.BooleanVar(value=item.get("completed", False))
@@ -1249,6 +1366,17 @@ class TaskDetailPane(ctk.CTkFrame):
                     text=f"Done at {ts}",
                     text_color="#9CA3AF",
                 ).pack(side="right")
+        self._adjust_plan_height(visible_rows)
+
+    def _adjust_plan_height(self, rows: int):
+        if rows <= 0:
+            height = 140
+        else:
+            height = min(320, max(140, rows * 36))
+        try:
+            self.plan_container.configure(height=height)
+        except tk.TclError:
+            pass
 
     def _style_plan_checkbox(self, item_id: str):
         record = self.plan_rows.get(item_id)
@@ -1295,18 +1423,35 @@ class TaskDetailPane(ctk.CTkFrame):
             self.links_label.pack(fill="x", padx=18, pady=(12, 0))
             self.links_frame.pack(fill="x", padx=18, pady=(4, 12))
         for url in links:
-            btn = ctk.CTkButton(
-                self.links_frame,
-                text=f"🔗 {shorten_url_display(url)}",
+            row = ctk.CTkFrame(self.links_frame, fg_color="#111827", corner_radius=12)
+            row.pack(fill="x", pady=4)
+            ctk.CTkLabel(
+                row,
+                text=shorten_url_display(url),
+                anchor="w",
+                font=("Segoe UI", 13, "bold"),
+            ).pack(side="left", fill="x", expand=True, padx=(12, 0), pady=10)
+            ctk.CTkButton(
+                row,
+                text="📋",
+                width=36,
+                command=lambda u=url: self._copy_link(u),
+                fg_color="#334155",
+                hover_color="#475569",
+            ).pack(side="right", padx=(4, 12), pady=8)
+            ctk.CTkButton(
+                row,
+                text="Open",
+                width=70,
                 command=lambda u=url: webbrowser.open(u),
-                height=32,
-                width=0,
-                fg_color="#1E3A8A",
-                hover_color="#1D4ED8",
-                text_color="#E0E7FF",
-                font=("Segoe UI", 13),
-            )
-            btn.pack(fill="x", pady=2)
+            ).pack(side="right", padx=(4, 0), pady=8)
+
+    def _copy_link(self, url: str):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(url)
+        except tk.TclError:
+            pass
 
     def _set_text(self, widget: ctk.CTkTextbox, value: str):
         widget.configure(state="normal")
@@ -1339,6 +1484,51 @@ class TaskDetailPane(ctk.CTkFrame):
             lines.append(line)
         return "\n".join(lines)
 
+    def _build_signature(self, task: dict) -> tuple:
+        plan_sig = tuple(
+            (item.get("id"), item.get("text"), bool(item.get("completed")), item.get("completed_at"))
+            for item in task.get("plan", []) or []
+        )
+        session_sig = tuple(
+            (
+                session.get("timestamp"),
+                session.get("minutes"),
+                session.get("note"),
+                tuple(session.get("plan_items") or []),
+            )
+            for session in task.get("sessions", []) or []
+        )
+        labels_sig = tuple(task.get("labels") or [])
+        return (
+            task.get("id"),
+            task.get("title"),
+            task.get("status"),
+            task.get("priority"),
+            task.get("type"),
+            task.get("who_asked"),
+            task.get("assignee"),
+            task.get("start_date"),
+            task.get("deadline"),
+            task.get("focus"),
+            task.get("time_spent_minutes"),
+            task.get("description"),
+            labels_sig,
+            plan_sig,
+            session_sig,
+        )
+
+    def _update_meta(self, values: dict[str, str]):
+        for key, label in self.meta_values.items():
+            value = values.get(key) or "—"
+            color = "#34D399" if key == "status" and value.lower() == "done" else "#F8FAFC"
+            label.configure(text=value, text_color=color)
+
+    def _auto_resize_textbox(self, widget: ctk.CTkTextbox, text: str, *, min_lines: int, max_lines: int):
+        lines = max(1, text.count("\n") + 1)
+        approx = max(lines, math.ceil(len(text) / 80))
+        approx = max(min_lines, min(max_lines, approx))
+        widget.configure(height=approx * 20)
+
     def _update_action_buttons(self, task: dict):
         focus_active = bool(task.get("focus"))
         self.focus_btn.configure(text="Unfocus" if focus_active else "Add focus")
@@ -1348,7 +1538,15 @@ class TaskDetailPane(ctk.CTkFrame):
 
     def _set_action_state(self, enabled: bool):
         state = "normal" if enabled else "disabled"
-        for widget in (self.focus_btn, self.timer_btn, self.log_btn, self.postpone_btn, self.done_btn, self.sessions_manage_btn, self.edit_btn):
+        for widget in (
+            self.focus_btn,
+            self.timer_btn,
+            self.log_btn,
+            self.postpone_btn,
+            self.done_btn,
+            self.sessions_manage_btn,
+            self.edit_btn,
+        ):
             widget.configure(state=state)
 
     def _toggle_focus(self):
@@ -1379,7 +1577,7 @@ class TaskDetailPane(ctk.CTkFrame):
         if not self.current_task or self.mode == "edit":
             return
         self.mode = "edit"
-        self.view_frame.pack_forget()
+        self.view_scroll.pack_forget()
         if not self.edit_container.winfo_manager():
             self.edit_container.pack(fill="both", expand=True)
         for child in self.editor_holder.winfo_children():
@@ -1400,7 +1598,7 @@ class TaskDetailPane(ctk.CTkFrame):
             return
         self.mode = "view"
         self.edit_container.pack_forget()
-        self.view_frame.pack(fill="both", expand=True)
+        self.view_scroll.pack(fill="both", expand=True)
         for child in self.editor_holder.winfo_children():
             child.destroy()
         self.editor_form = None
@@ -2508,12 +2706,13 @@ class TaskFocusApp(ctk.CTk):
         # Content split: list + preview
         today_content = ctk.CTkFrame(self.today_tab, fg_color="transparent")
         today_content.pack(fill="both", expand=True)
-        today_content.grid_columnconfigure(0, weight=2)
-        today_content.grid_columnconfigure(1, weight=1)
+        today_content.grid_columnconfigure(0, weight=1, minsize=280)
+        today_content.grid_columnconfigure(1, weight=3, minsize=420)
         today_content.grid_rowconfigure(0, weight=1)
 
         self.today_list = ctk.CTkScrollableFrame(today_content)
-        self.today_list.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+        self.today_list.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=(0, 8))
+        configure_fast_scroll(self.today_list, multiplier=3)
 
         self.today_preview = TaskDetailPane(
             today_content,
@@ -2528,7 +2727,7 @@ class TaskFocusApp(ctk.CTk):
             people_options=self._people_option_values(),
             label_options=self.label_options,
         )
-        self.today_preview.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
+        self.today_preview.grid(row=0, column=1, sticky="nsew", padx=(10, 0), pady=(0, 8))
 
     def _build_all_tab(self):
         # Filters bar
@@ -2558,12 +2757,13 @@ class TaskFocusApp(ctk.CTk):
 
         all_content = ctk.CTkFrame(self.all_tab, fg_color="transparent")
         all_content.pack(fill="both", expand=True)
-        all_content.grid_columnconfigure(0, weight=2)
-        all_content.grid_columnconfigure(1, weight=1)
+        all_content.grid_columnconfigure(0, weight=1, minsize=280)
+        all_content.grid_columnconfigure(1, weight=3, minsize=420)
         all_content.grid_rowconfigure(0, weight=1)
 
         self.all_list = ctk.CTkScrollableFrame(all_content)
-        self.all_list.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+        self.all_list.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=(0, 8))
+        configure_fast_scroll(self.all_list, multiplier=3)
 
         self.all_preview = TaskDetailPane(
             all_content,
@@ -2578,7 +2778,7 @@ class TaskFocusApp(ctk.CTk):
             people_options=self._people_option_values(),
             label_options=self.label_options,
         )
-        self.all_preview.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
+        self.all_preview.grid(row=0, column=1, sticky="nsew", padx=(10, 0), pady=(0, 8))
 
     def _build_stats_tab(self):
         if not MATPLOTLIB_AVAILABLE:
