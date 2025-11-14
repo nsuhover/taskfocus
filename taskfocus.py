@@ -1540,6 +1540,134 @@ class TaskEditorForm(ctk.CTkFrame):
         return payload
 
 
+class LabelsEditor(ctk.CTkFrame):
+    def __init__(self, master, labels: list[str] | None, suggestions: list[str] | None):
+        super().__init__(master, fg_color="#0F172A", corner_radius=12)
+        self._labels: list[str] = []
+        self._label_keys: set[str] = set()
+        self._suggestions: list[str] = suggestions[:] if suggestions else []
+
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(12, 0))
+        ctk.CTkLabel(
+            header,
+            text="Labels",
+            font=("Segoe UI Semibold", 14),
+        ).pack(side="left")
+
+        self._entry = ctk.CTkEntry(self, placeholder_text="Add label…")
+        self._entry.pack(fill="x", padx=12, pady=(8, 0))
+        self._entry.bind("<Return>", lambda _event: self._commit_entry())
+
+        controls = ctk.CTkFrame(self, fg_color="transparent")
+        controls.pack(fill="x", padx=12, pady=(8, 0))
+
+        self._add_btn = ctk.CTkButton(controls, text="Add", width=80, command=self._commit_entry)
+        self._add_btn.pack(side="left")
+
+        self._suggestion_menu = ctk.CTkOptionMenu(
+            controls,
+            values=self._menu_values(),
+            command=self._handle_suggestion,
+            width=160,
+        )
+        self._suggestion_menu.pack(side="left", padx=(8, 0))
+        self._suggestion_menu.set("Suggestions" if self._suggestions else "No labels yet")
+
+        self._chips = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self._chips.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+        self._chip_container = getattr(self._chips, "scrollable_frame", self._chips)
+
+        if labels:
+            self.set_labels(labels)
+        else:
+            self._render_chips()
+
+    def _menu_values(self) -> list[str]:
+        if not self._suggestions:
+            return ["No labels yet"]
+        placeholder = "Suggestions"
+        return [placeholder, *sorted(dict.fromkeys(self._suggestions))]
+
+    def _handle_suggestion(self, value: str):
+        if value in ("Suggestions", "No labels yet"):
+            return
+        self._add_label(value)
+        self._suggestion_menu.set("Suggestions")
+
+    def _commit_entry(self):
+        text = self._entry.get().strip()
+        if not text:
+            return
+        self._add_label(text)
+        self._entry.delete(0, tk.END)
+
+    def _add_label(self, label: str):
+        normalized = label.strip()
+        if not normalized:
+            return
+        key = normalized.lower()
+        if key in self._label_keys:
+            return
+        self._labels.append(normalized)
+        self._label_keys.add(key)
+        self._render_chips()
+
+    def _remove_label(self, label: str):
+        key = label.lower()
+        self._labels = [lbl for lbl in self._labels if lbl.lower() != key]
+        self._label_keys = {lbl.lower() for lbl in self._labels}
+        self._render_chips()
+
+    def _render_chips(self):
+        for child in self._chip_container.winfo_children():
+            child.destroy()
+        if not self._labels:
+            ctk.CTkLabel(
+                self._chip_container,
+                text="No labels yet.",
+                text_color="#94A3B8",
+            ).pack(fill="x", pady=6)
+            return
+        for label in self._labels:
+            row = ctk.CTkFrame(self._chip_container, fg_color="#1E293B", corner_radius=16)
+            row.pack(side="top", anchor="w", pady=4, padx=2, fill="x")
+            ctk.CTkLabel(row, text=label, padx=8).pack(side="left", padx=(4, 0), pady=4)
+            ctk.CTkButton(
+                row,
+                text="✕",
+                width=32,
+                command=lambda lbl=label: self._remove_label(lbl),
+                fg_color="#dc2626",
+                hover_color="#b91c1c",
+            ).pack(side="right", padx=4, pady=4)
+
+    def get_labels(self) -> list[str]:
+        return list(self._labels)
+
+    def set_labels(self, labels: list[str]):
+        unique: list[str] = []
+        keys: set[str] = set()
+        for label in labels:
+            if not label:
+                continue
+            key = label.lower()
+            if key in keys:
+                continue
+            keys.add(key)
+            unique.append(label)
+        self._labels = unique
+        self._label_keys = keys
+        self._render_chips()
+
+    def set_suggestions(self, suggestions: list[str]):
+        self._suggestions = suggestions[:] if suggestions else []
+        values = self._menu_values()
+        self._suggestion_menu.configure(values=values)
+        placeholder = "Suggestions" if self._suggestions else "No labels yet"
+        self._suggestion_menu.set(placeholder)
+
+
 class PlanEditorFrame(ctk.CTkFrame):
     def __init__(self, master, plan_items: list[dict] | None = None):
         super().__init__(master, fg_color="#111827", corner_radius=12)
