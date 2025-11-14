@@ -3592,7 +3592,8 @@ class TaskFocusApp(ctk.CTk):
         return all(token in combined for token in tokens)
 
     def _refresh_today_list(self):
-        for w in self.today_list.winfo_children():
+        body = self._list_body(self.today_list)
+        for w in body.winfo_children():
             w.destroy()
         tasks = self.store.eligible_today()
         tasks.sort(key=sort_key)
@@ -3606,19 +3607,20 @@ class TaskFocusApp(ctk.CTk):
         others = [t for t in tasks if not t.get("focus")]
 
         if focused:
-            ctk.CTkLabel(self.today_list, text="Focus ⭐", font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(4,4), padx=6)
+            ctk.CTkLabel(body, text="Focus ⭐", font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(4, 4), padx=6)
             for t in focused:
-                self._add_task_card(self.today_list, t)
+                self._add_task_card(body, t)
 
-        ctk.CTkLabel(self.today_list, text="Available Today", font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(12,4), padx=6)
+        ctk.CTkLabel(body, text="Available Today", font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(12, 4), padx=6)
         for t in others:
-            self._add_task_card(self.today_list, t)
+            self._add_task_card(body, t)
 
         if not tasks:
-            ctk.CTkLabel(self.today_list, text="No tasks available to start today.").pack(pady=12)
+            ctk.CTkLabel(body, text="No tasks available to start today.").pack(pady=12)
 
     def _refresh_all_list(self):
-        for w in self.all_list.winfo_children():
+        body = self._list_body(self.all_list)
+        for w in body.winfo_children():
             w.destroy()
         status = self.status_filter.get()
         if status == "all":
@@ -3632,9 +3634,10 @@ class TaskFocusApp(ctk.CTk):
             if needle:
                 tasks = [t for t in tasks if self._task_matches_query(t, needle)]
         for t in tasks:
-            self._add_task_card(self.all_list, t)
+            self._add_task_card(body, t)
         if not tasks:
-            ctk.CTkLabel(self.all_list, text="No tasks to show.").pack(pady=12)
+            ctk.CTkLabel(body, text="No tasks to show.").pack(pady=12)
+        self._ensure_default_selection()
 
     def _add_task_card(self, parent, task: dict):
         is_selected = bool(self.selected_task_id and task.get("id") == self.selected_task_id)
@@ -3647,6 +3650,11 @@ class TaskFocusApp(ctk.CTk):
         card.pack(fill="x", padx=12, pady=10)
         if is_selected:
             self._selected_card_widget = card
+
+    def _list_body(self, container):
+        if container is None:
+            return None
+        return getattr(container, "scrollable_frame", container)
 
     def _on_task_card_selected(self, card: TaskCard, _event=None):
         if not isinstance(card, TaskCard):
@@ -3663,9 +3671,10 @@ class TaskFocusApp(ctk.CTk):
         selected_id = self.selected_task_id
         found = False
         for container in (getattr(self, "today_list", None), getattr(self, "all_list", None)):
-            if container is None:
+            body = self._list_body(container)
+            if body is None:
                 continue
-            for child in container.winfo_children():
+            for child in body.winfo_children():
                 if isinstance(child, TaskCard):
                     is_selected = bool(selected_id and child.task.get("id") == selected_id)
                     child.set_selected(is_selected)
@@ -3674,6 +3683,24 @@ class TaskFocusApp(ctk.CTk):
                         found = True
         if not found and selected_id:
             self.selected_task_id = None
+
+    def _ensure_default_selection(self):
+        if self.selected_task_id:
+            return
+        for container in (getattr(self, "today_list", None), getattr(self, "all_list", None)):
+            body = self._list_body(container)
+            if body is None:
+                continue
+            for child in body.winfo_children():
+                if isinstance(child, TaskCard):
+                    task_id = child.task.get("id")
+                    if not task_id:
+                        continue
+                    self.selected_task_id = task_id
+                    self._selected_card_widget = child
+                    self._sync_card_selection()
+                    self._show_preview_for_task(task_id)
+                    return
 
     def _show_preview_for_task(self, task_id: int | None):
         task = self.store.get_task(task_id) if task_id else None
