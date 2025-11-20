@@ -3533,7 +3533,8 @@ class TaskFocusApp(ctk.CTk):
             self._refresh_stats()
             self._stats_dirty = False
         self._sync_card_selection()
-        self._show_preview_for_task(self.selected_task_id)
+        if self.selected_task_id:
+            self._show_preview_for_task(self.selected_task_id)
 
     def _rebuild_search_cache(self):
         cache: dict[str, str] = {}
@@ -3642,6 +3643,7 @@ class TaskFocusApp(ctk.CTk):
 
         if not tasks:
             ctk.CTkLabel(body, text="No tasks available to start today.").pack(pady=12)
+        self._ensure_default_selection()
 
     def _refresh_all_list(self):
         body = self._list_body(self.all_list)
@@ -3701,7 +3703,7 @@ class TaskFocusApp(ctk.CTk):
         self.selected_task_id = task_id
         self._selected_card_widget = card
         self._sync_card_selection()
-        self._show_preview_for_task(task_id)
+        self._show_preview_for_task(card.task)
 
     def _sync_card_selection(self):
         selected_id = self.selected_task_id
@@ -3739,10 +3741,17 @@ class TaskFocusApp(ctk.CTk):
                     self._show_preview_for_task(task_id)
                     return
 
-    def _show_preview_for_task(self, task_id: int | str | None):
-        key = self._task_id_value(task_id)
-        task = self.store.get_task(key) if key else None
-        if not task and key and self._selected_card_widget:
+    def _show_preview_for_task(self, task_or_id):
+        key = None
+        task = None
+        if isinstance(task_or_id, dict):
+            task = task_or_id
+            key = self._task_id_value(task)
+        else:
+            key = self._task_id_value(task_or_id)
+        if task is None and key:
+            task = self.store.get_task(key)
+        if task is None and key and self._selected_card_widget:
             card_id = self._task_id_value(self._selected_card_widget.task)
             if card_id == key:
                 task = self._selected_card_widget.task
