@@ -476,11 +476,12 @@ class TaskStore:
         }
         # Keep a direct lookup of task id -> task dict so high-frequency
         # operations (toggling focus, logging sessions, refreshing previews)
-        # do not require scanning the entire task list each time. The index is
-        # rebuilt whenever tasks are reloaded from disk and kept in sync for all
-        # mutations, which noticeably improves responsiveness when hundreds of
-        # tasks exist.
-        self._task_index: dict[int, dict] = {}
+        # do not require scanning the entire task list each time. Legacy data
+        # may store ids as strings, so the index stores canonical string keys
+        # to support both formats. The index is rebuilt whenever tasks are
+        # reloaded from disk and kept in sync for all mutations, which
+        # noticeably improves responsiveness when hundreds of tasks exist.
+        self._task_index: dict[str, dict] = {}
         self.load()
 
     def load(self):
@@ -579,15 +580,25 @@ class TaskStore:
             total = 0
         task["time_spent_minutes"] = max(total, 0)
 
+    def _normalize_task_key(self, task_id) -> str | None:
+        if task_id is None:
+            return None
+        if isinstance(task_id, str):
+            tid = task_id.strip()
+            return tid or None
+        try:
+            return str(int(task_id))
+        except Exception:
+            text = str(task_id).strip()
+            return text or None
+
     def _index_task(self, task: dict | None) -> None:
         if not task:
             return
-        try:
-            tid = int(task.get("id"))
-        except Exception:
+        key = self._normalize_task_key(task.get("id"))
+        if not key:
             return
-        if tid:
-            self._task_index[tid] = task
+        self._task_index[key] = task
 
     def _rebuild_index(self) -> None:
         self._task_index = {}
@@ -694,7 +705,8 @@ class TaskStore:
 
     def update_task(self, task_id: int, updates: dict):
         updates = dict(updates or {})
-        task = self._task_index.get(task_id)
+        key = self._normalize_task_key(task_id)
+        task = self._task_index.get(key) if key else None
         if not task:
             return None
         plan_updates = updates.pop("plan", None)
@@ -711,7 +723,8 @@ class TaskStore:
         return task
 
     def set_plan_completion(self, task_id: int, item_id: str, completed: bool):
-        task = self._task_index.get(task_id)
+        key = self._normalize_task_key(task_id)
+        task = self._task_index.get(key) if key else None
         if not task:
             return None
         self._ensure_task_defaults(task)
@@ -729,12 +742,18 @@ class TaskStore:
         return None
 
     def delete_task(self, task_id: int):
-        self.data["tasks"] = [t for t in self.data["tasks"] if t.get("id") != task_id]
-        self._task_index.pop(task_id, None)
+        key = self._normalize_task_key(task_id)
+        if key is None:
+            return
+        self.data["tasks"] = [
+            t for t in self.data["tasks"] if self._normalize_task_key(t.get("id")) != key
+        ]
+        self._task_index.pop(key, None)
         self.save()
 
-    def get_task(self, task_id: int) -> dict | None:
-        task = self._task_index.get(task_id)
+    def get_task(self, task_id) -> dict | None:
+        key = self._normalize_task_key(task_id)
+        task = self._task_index.get(key) if key else None
         if not task:
             return None
         return self._ensure_task_defaults(task)
@@ -786,7 +805,8 @@ class TaskStore:
         timestamp: str | None = None,
         plan_item_ids: list[str] | None = None,
     ):
-        task = self._task_index.get(task_id)
+        key = self._normalize_task_key(task_id)
+        task = self._task_index.get(key) if key else None
         if not task:
             return None
         self._ensure_task_defaults(task)
@@ -814,7 +834,8 @@ class TaskStore:
         note: str,
         plan_item_ids: list[str] | None = None,
     ) -> dict | None:
-        task = self._task_index.get(task_id)
+        key = self._normalize_task_key(task_id)
+        task = self._task_index.get(key) if key else None
         if not task:
             return None
         self._ensure_task_defaults(task)
@@ -895,6 +916,8 @@ class TaskCard(ctk.CTkFrame):
             font=("Segoe UI", 15, "bold"),
             anchor="w",
             justify="left",
+            wraplength=260,
+            height=40,
         )
         self.title_label.pack(side="left", fill="x", expand=True)
 
@@ -1237,8 +1260,8 @@ class TaskDetailPane(ctk.CTkFrame):
             self.editor_form.load_task(task)
 
     def _ensure_content_visible(self):
+        self.placeholder.pack_forget()
         if not self.content.winfo_manager():
-            self.placeholder.pack_forget()
             self.content.pack(fill="both", expand=True)
         if not self.view_scroll.winfo_manager():
             self.view_scroll.pack(fill="both", expand=True)
@@ -1248,6 +1271,8 @@ class TaskDetailPane(ctk.CTkFrame):
     def _show_placeholder(self):
         if self.content.winfo_manager():
             self.content.pack_forget()
+        if self.view_scroll.winfo_manager():
+            self.view_scroll.pack_forget()
         if not self.placeholder.winfo_manager():
             self.placeholder.pack(expand=True, padx=18, pady=18)
         self.mode = "empty"
@@ -2584,7 +2609,7 @@ class TaskFocusApp(ctk.CTk):
     _refresh_job: str | None = None
     _stats_dirty: bool = True
     _search_cache_dirty: bool = True
-    _search_cache: dict[int, str] = {}
+    _search_cache: dict[str, str] = {}
 
     def __init__(self, store: TaskStore):
         super().__init__()
@@ -2606,7 +2631,7 @@ class TaskFocusApp(ctk.CTk):
         self._search_cache_dirty = True
         self._search_cache = {}
         self._labels_dirty = True
-        self.selected_task_id: int | None = None
+        self.selected_task_id: str | None = None
         self._selected_card_widget: TaskCard | None = None
 
         self.bind("<Configure>", self._on_window_configure)
@@ -2706,8 +2731,8 @@ class TaskFocusApp(ctk.CTk):
         # Content split: list + preview
         today_content = ctk.CTkFrame(self.today_tab, fg_color="transparent")
         today_content.pack(fill="both", expand=True)
-        today_content.grid_columnconfigure(0, weight=1, minsize=280)
-        today_content.grid_columnconfigure(1, weight=3, minsize=420)
+        today_content.grid_columnconfigure(0, weight=1, uniform="split", minsize=260)
+        today_content.grid_columnconfigure(1, weight=3, uniform="split", minsize=420)
         today_content.grid_rowconfigure(0, weight=1)
 
         self.today_list = ctk.CTkScrollableFrame(today_content)
@@ -2757,8 +2782,8 @@ class TaskFocusApp(ctk.CTk):
 
         all_content = ctk.CTkFrame(self.all_tab, fg_color="transparent")
         all_content.pack(fill="both", expand=True)
-        all_content.grid_columnconfigure(0, weight=1, minsize=280)
-        all_content.grid_columnconfigure(1, weight=3, minsize=420)
+        all_content.grid_columnconfigure(0, weight=1, uniform="split", minsize=260)
+        all_content.grid_columnconfigure(1, weight=3, uniform="split", minsize=420)
         all_content.grid_rowconfigure(0, weight=1)
 
         self.all_list = ctk.CTkScrollableFrame(all_content)
@@ -3511,9 +3536,9 @@ class TaskFocusApp(ctk.CTk):
         self._show_preview_for_task(self.selected_task_id)
 
     def _rebuild_search_cache(self):
-        cache: dict[int, str] = {}
+        cache: dict[str, str] = {}
         for task in self.store.data.get("tasks", []):
-            tid = task.get("id")
+            tid = self._task_id_value(task)
             if not tid:
                 continue
             cache[tid] = self._task_search_blob(task)
@@ -3576,12 +3601,12 @@ class TaskFocusApp(ctk.CTk):
     def _task_matches_query(self, task: dict, query: str) -> bool:
         if not query:
             return True
-        blob = self._search_cache.get(task.get("id"))
+        key = self._task_id_value(task)
+        blob = self._search_cache.get(key)
         if blob is None:
             blob = self._task_search_blob(task)
-            tid = task.get("id")
-            if tid:
-                self._search_cache[tid] = blob
+            if key:
+                self._search_cache[key] = blob
         combined = blob or ""
         query = query.lower()
         if query in combined:
@@ -3640,7 +3665,8 @@ class TaskFocusApp(ctk.CTk):
         self._ensure_default_selection()
 
     def _add_task_card(self, parent, task: dict):
-        is_selected = bool(self.selected_task_id and task.get("id") == self.selected_task_id)
+        task_id = self._task_id_value(task)
+        is_selected = bool(self.selected_task_id and task_id == self.selected_task_id)
         card = TaskCard(
             parent,
             task,
@@ -3656,10 +3682,20 @@ class TaskFocusApp(ctk.CTk):
             return None
         return getattr(container, "scrollable_frame", container)
 
+    def _task_id_value(self, source) -> str | None:
+        if isinstance(source, dict):
+            value = source.get("id")
+        else:
+            value = source
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
     def _on_task_card_selected(self, card: TaskCard, _event=None):
         if not isinstance(card, TaskCard):
             return
-        task_id = card.task.get("id")
+        task_id = self._task_id_value(card.task)
         if not task_id:
             return
         self.selected_task_id = task_id
@@ -3676,7 +3712,8 @@ class TaskFocusApp(ctk.CTk):
                 continue
             for child in body.winfo_children():
                 if isinstance(child, TaskCard):
-                    is_selected = bool(selected_id and child.task.get("id") == selected_id)
+                    card_id = self._task_id_value(child.task)
+                    is_selected = bool(selected_id and card_id == selected_id)
                     child.set_selected(is_selected)
                     if is_selected:
                         self._selected_card_widget = child
@@ -3693,7 +3730,7 @@ class TaskFocusApp(ctk.CTk):
                 continue
             for child in body.winfo_children():
                 if isinstance(child, TaskCard):
-                    task_id = child.task.get("id")
+                    task_id = self._task_id_value(child.task)
                     if not task_id:
                         continue
                     self.selected_task_id = task_id
@@ -3702,8 +3739,13 @@ class TaskFocusApp(ctk.CTk):
                     self._show_preview_for_task(task_id)
                     return
 
-    def _show_preview_for_task(self, task_id: int | None):
-        task = self.store.get_task(task_id) if task_id else None
+    def _show_preview_for_task(self, task_id: int | str | None):
+        key = self._task_id_value(task_id)
+        task = self.store.get_task(key) if key else None
+        if not task and key and self._selected_card_widget:
+            card_id = self._task_id_value(self._selected_card_widget.task)
+            if card_id == key:
+                task = self._selected_card_widget.task
         if not task:
             self.selected_task_id = None
             if hasattr(self, "today_preview"):
